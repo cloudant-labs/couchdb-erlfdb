@@ -857,6 +857,10 @@ erlfdb_database_create_transaction(
 
     t = enif_alloc_resource(ErlFDBTransactionRes, sizeof(ErlFDBTransaction));
     t->transaction = transaction;
+    t->lock = enif_mutex_create(NULL);
+    t->locked = 0;
+    t->owner = NULL;
+    t->env = NULL;
 
     ret = enif_make_resource(env, t);
     enif_release_resource(t);
@@ -957,6 +961,101 @@ erlfdb_transaction_set_option(
     if(err != 0) {
         return erlfdb_erlang_error(env, err);
     }
+
+    return ATOM_ok;
+}
+
+
+static ERL_NIF_TERM
+erlfdb_transaction_lock(
+        ErlNifEnv* env,
+        int argc,
+        const ERL_NIF_TERM argv[]
+    )
+{
+    ErlFDBSt* st = (ErlFDBSt*) enif_priv_data(env);
+    ErlFDBTransaction* t;
+    ErlFDBTransactionLock* l;
+    ErlNifPid self;
+    ERL_NIF_TERM pid;
+    ERL_NIF_TERM ref;
+    ERL_NIF_TERM ret;
+    void* res;
+
+    if(st->lib_state != ErlFDB_CONNECTED) {
+        return enif_make_badarg(env);
+    }
+
+    if(argc != 2) {
+        return enif_make_badarg(env);
+    }
+
+    if(!enif_get_resource(env, argv[0], ErlFDBTransactionRes, &res)) {
+        return enif_make_badarg(env);
+    }
+    t = (ErlFDBTransaction*) res;
+
+    enif_mutex_lock(t->lock);
+
+    if(t->locked) {
+        if(t->env == NULL) {
+            t->env = enif_alloc_env();
+            t->waiters = enif_make_list(env, 0);
+        }
+
+        enif_self(env, &self);
+        pid = enif_make_pid(env, &self);
+        ref = enif_make_ref(env);
+
+        t->waiters = enif_make_list_cell(env, T2(env, pid, ref), t->waiters);
+
+        ret = T2(env, ATOM_locked, ref);
+    } else {
+        l = enif_alloc_resource(
+                ErlFDBTransactionLockRes,
+                sizeof(ErlFDBTransactionLock)
+            );
+        l->t = t;
+
+        t->locked = 1;
+        t->owner = l;
+
+        ret = enif_make_resource(env, t);
+        enif_release_resource(t);
+        ret = T2(env, ATOM_erlfdb_transaction_lock, ret);
+    }
+
+    enif_mutex_unlock(t->lock);
+
+    return ret;
+}
+
+
+static ERL_NIF_TERM
+erlfdb_transaction_unlock(
+        ErlNifEnv* env,
+        int argc,
+        const ERL_NIF_TERM argv[]
+    )
+{
+    ErlFDBSt* st = (ErlFDBSt*) enif_priv_data(env);
+    ErlFDBTransactionLock* l;
+    void* res;
+
+    if(st->lib_state != ErlFDB_CONNECTED) {
+        return enif_make_badarg(env);
+    }
+
+    if(argc != 1) {
+        return enif_make_badarg(env);
+    }
+
+    if(!enif_get_resource(env, argv[0], ErlFDBTransactionLockRes, &res)) {
+        return enif_make_badarg(env);
+    }
+    l = (ErlFDBTransactionLock*) res;
+
+    erlfdb_transaction_lock_destroy(env, l);
 
     return ATOM_ok;
 }
@@ -1866,6 +1965,8 @@ static ErlNifFunc funcs[] =
     NIF_FUNC(erlfdb_database_create_transaction, 1),
 
     NIF_FUNC(erlfdb_transaction_set_option, 3),
+    NIF_FUNC(erlfdb_transaction_lock, 1),
+    NIF_FUNC(erlfdb_transaction_unlock, 1),
     NIF_FUNC(erlfdb_transaction_set_read_version, 2),
     NIF_FUNC(erlfdb_transaction_get_read_version, 1),
     NIF_FUNC(erlfdb_transaction_get, 3),

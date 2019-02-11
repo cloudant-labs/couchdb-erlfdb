@@ -37,6 +37,8 @@
 
     transaction_set_option/2,
     transaction_set_option/3,
+    transaction_lock/1,
+    transaction_unlock/1,
     transaction_set_read_version/2,
     transaction_get_read_version/1,
     transaction_get/3,
@@ -69,6 +71,7 @@
 -type cluster() :: {erlfdb_cluster, reference()}.
 -type database() :: {erlfdb_database, reference()}.
 -type transaction() :: {erlfdb_transaction, reference()}.
+-type transaction_lock() :: {erlfdb_transaction_lock, reference()}.
 
 -type option_value() :: integer() | binary().
 
@@ -286,6 +289,16 @@ transaction_set_option({erlfdb_transaction, Tx}, Opt, Val) ->
         I when is_integer(I) -> <<I:8/little-unsigned-integer-unit:8>>
     end,
     erlfdb_transaction_set_option(Tx, Opt, BinVal).
+
+
+-spec transaction_lock(transaction()) -> transaction_lock().
+transaction_lock({erlfdb_transaction, Tx}) ->
+    erlfdb_transaction_lock(Tx).
+
+
+-spec transaction_unlock(transaction_lock()) -> ok.
+transaction_unlock({erlfdb_transaction_lock, Lock}) ->
+    erlfdb_transaction_unlock(Lock).
 
 
 -spec transaction_set_read_version(transaction(), Version::integer()) -> ok.
@@ -533,6 +546,8 @@ erlfdb_transaction_set_option(
         _TransactionOption,
         _Value
     ) -> ?NOT_LOADED.
+erlfdb_transaction_lock(_Transaction) -> ?NOT_LOADED.
+erlfdb_transaction_unlock(_TransactionLock) -> ?NOT_LOADED.
 erlfdb_transaction_set_read_version(_Transaction, _Version) -> ?NOT_LOADED.
 erlfdb_transaction_get_read_version(_Transaction) -> ?NOT_LOADED.
 erlfdb_transaction_get(_Transaction, _Key, _Snapshot) -> ?NOT_LOADED.

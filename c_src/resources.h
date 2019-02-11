@@ -21,6 +21,7 @@ extern ErlNifResourceType* ErlFDBFutureRes;
 extern ErlNifResourceType* ErlFDBClusterRes;
 extern ErlNifResourceType* ErlFDBDatabaseRes;
 extern ErlNifResourceType* ErlFDBTransactionRes;
+extern ErlNifResourceType* ErlFDBTransactionLockRes;
 
 
 typedef enum _ErlFDBFutureType
@@ -63,7 +64,19 @@ typedef struct _ErlFDBDatabase
 typedef struct _ErlFDBTransaction
 {
     FDBTransaction* transaction;
+    ErlNifMutex* lock;
+    int locked;
+    struct _ErlFDBTransactionLock* owner;
+
+    ErlNifEnv* env;
+    ERL_NIF_TERM waiters;
 } ErlFDBTransaction;
+
+
+typedef struct _ErlFDBTransactionLock
+{
+    ErlFDBTransaction* t;
+} ErlFDBTransactionLock;
 
 
 int erlfdb_init_resources(ErlNifEnv* env);
@@ -71,6 +84,9 @@ void erlfdb_future_dtor(ErlNifEnv* env, void* obj);
 void erlfdb_cluster_dtor(ErlNifEnv* env, void* obj);
 void erlfdb_database_dtor(ErlNifEnv* env, void* obj);
 void erlfdb_transaction_dtor(ErlNifEnv* env, void* obj);
+void erlfdb_transaction_lock_dtor(ErlNifEnv* env, void* obj);
+
+void erlfdb_transaction_lock_destroy(ErlNifEnv* env, ErlFDBTransactionLock* l);
 
 
 #endif // Included resources.h

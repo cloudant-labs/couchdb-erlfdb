@@ -103,7 +103,10 @@
 
     % Misc
     on_error/2,
-    error_predicate/2
+    error_predicate/2,
+
+    % Advanced Coordination
+    with_tx_lock/2
 ]).
 
 
@@ -477,6 +480,35 @@ error_predicate(Predicate, {erlfdb_error, ErrorCode}) ->
 
 error_predicate(Predicate, ErrorCode) ->
     erlfdb_nif:error_predicate(Predicate, ErrorCode).
+
+
+with_tx_lock(Tx, Fun) ->
+    with_tx_lock(Tx, Fun, []).
+
+
+with_tx_lock(Tx, Fun, Options) ->
+    Timeout = get_value(Options, timeout, 5000),
+    with_tx_lock_impl(Tx, Fun, Timeout).
+
+
+with_tx_lock_impl(?IS_TX = Tx, Fun, Timeout) when is_function(Fun, 0) ->
+    Start = os:timestamp(),
+    case erlfdb_nif:transaction_lock(Tx) of
+        {erlfdb_transaction_lock, _} = Lock ->
+            try
+                Fun()
+            after
+                erlfdb_nif:transaction_unlock(Lock)
+            end;
+        {locked, Ref} ->
+            receive
+                {unlocked, Ref} ->
+                    Diff = timer:now_diff(os:timestamp(), Start) div 1000,
+                    with_tx_lock(Tx, Fun, Timeout - Diff)
+            after Timeout ->
+                erlang:error(erlfdb_tx_lock_timeout)
+            end
+    end.
 
 
 -record(fold_st, {
