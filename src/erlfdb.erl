@@ -134,7 +134,10 @@ transactional(?IS_DB = Db, UserFun) when is_function(UserFun, 1) ->
     catch error:{erlfdb_error, Code} ->
         wait(on_error(Tx, Code)),
         transactional(Db, UserFun)
-    end.
+    end;
+
+transactional(?IS_TX = Tx, UserFun) when is_function(UserFun, 1) ->
+    UserFun(Tx).
 
 
 set_option(DbOrTx, Option) ->
@@ -183,16 +186,28 @@ block_until_ready(?IS_FUTURE = Future) ->
 
 
 wait(?IS_FUTURE = Future) ->
-    wait(Future, []).
+    wait(Future, []);
+
+wait(Ready) ->
+    Ready.
+
 
 wait(?IS_FUTURE = Future, Options) ->
-    Timeout = erlfdb_util:get(Options, timeout, 5000),
-    {erlfdb_future, MsgRef, _Res} = Future,
-    receive
-        {MsgRef, ready} -> get(Future)
-    after Timeout ->
-        erlang:error({timeout, Future})
-    end.
+    case is_ready(Future) of
+        true ->
+            get(Future);
+        false ->
+            Timeout = erlfdb_util:get(Options, timeout, 5000),
+            {erlfdb_future, MsgRef, _Res} = Future,
+            receive
+                {MsgRef, ready} -> get(Future)
+            after Timeout ->
+                erlang:error({timeout, Future})
+            end
+    end;
+
+wait(Ready, _) ->
+    Ready.
 
 
 wait_for_any(Futures) ->

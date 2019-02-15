@@ -55,7 +55,7 @@ current_start(HCA, Tx) ->
     #erlfdb_hca{
         counters = Counters
     } = HCA,
-    {CRangeStart, CRangeEnd} = ?ERLFDB_RANGE(Counters),
+    {CRangeStart, CRangeEnd} = counter_range(Counters),
     Options = [
         {snapshot, true},
         {reverse, true},
@@ -81,7 +81,7 @@ range(HCA, Tx, Start, WindowAdvanced) ->
     end,
 
     CounterKey = ?ERLFDB_EXTEND(Counters, Start),
-    erlfbd:add(Tx, CounterKey, 1),
+    erlfdb:add(Tx, CounterKey, 1),
 
     Count = case erlfdb:wait(erlfdb:get_ss(Tx, CounterKey)) of
         <<C:64/little>> -> C;
@@ -111,7 +111,7 @@ search_candidate(HCA, Tx, {Start, WindowSize}) ->
         {streaming_mode, exact},
         {limit, 1}
     ],
-    {CRangeStart, CRangeEnd} = ?ERLFDB_RANGE(Counters),
+    {CRangeStart, CRangeEnd} = counter_range(Counters),
 
     CFuture = erlfdb:get_range(Tx, CRangeStart, CRangeEnd, Options),
     CVFuture = erlfdb:get(Tx, CandidateValueKey),
@@ -153,6 +153,11 @@ clear_previous_window(HCA, Tx, Start) ->
     erlfdb:clear_range(Tx, CRangeStart, CRangeEnd),
     erlfdb:set_option(Tx, next_write_no_conflict_range),
     erlfdb:clear_range(Tx, RRangeStart, RRangeEnd).
+
+
+counter_range(Counters) ->
+    S = erlfdb_subspace:create({}, Counters),
+    erlfdb_subspace:range(S).
 
 
 window_size(Start) ->

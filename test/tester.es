@@ -4,6 +4,18 @@
 -mode(compile).
 
 
+-define(DIRECTORY_CREATE_OPS, [
+    <<"DIRECTORY_CREATE_SUBSPACE">>,
+    <<"DIRECTORY_CREATE_LAYER">>,
+    <<"DIRECTORY_CREATE_OR_OPEN">>,
+    <<"DIRECTORY_CREATE">>,
+    <<"DIRECTORY_OPEN">>,
+    <<"DIRECTORY_MOVE">>,
+    <<"DIRECTORY_MOVE_TO">>,
+    <<"DIRECTORY_OPEN_SUBSPACE">>
+]).
+
+
 -record(st, {
     db,
     tx_mgr,
@@ -16,7 +28,12 @@
     is_snapshot,
     last_version,
     pids,
-    directory_extension
+
+    % Directory Layer tests
+    is_directory_op,
+    dir_list,
+    dir_index,
+    dir_error_index
 }).
 
 
@@ -209,6 +226,20 @@ stack_push_range(#st{stack = Pid, index = Idx}, Results, PrefixFilter) ->
     stack_push(Pid, {Idx, Value}).
 
 
+stack_pop_tuples(St) ->
+    {Tuple} = stack_pop_tuples(St, 1),
+    Tuple.
+
+
+stack_pop_tuples(St, Count) ->
+    TupleList = lists:map(fun(_) ->
+        TupleSize = stack_pop(St),
+        TupleElems = stack_pop(St, TupleSize),
+        list_to_tuple(TupleElems)
+    end, lists:seq(1, Count)),
+    list_to_tuple(TupleList).
+
+
 get_transaction(TxName) ->
     get({'$erlfdb_tx', TxName}).
 
@@ -216,6 +247,14 @@ get_transaction(TxName) ->
 new_transaction(Db, TxName) ->
     Tx = erlfdb:create_transaction(Db),
     put({'$erlfdb_tx', TxName}, Tx).
+
+
+has_prefix(Subject, Prefix) ->
+    PrefLen = size(Prefix),
+    case Subject of
+        <<Prefix:PrefLen/binary, _/binary>> -> true;
+        _ -> false
+    end.
 
 
 has_suffix(Subject, Suffix) ->
@@ -261,6 +300,15 @@ wait_for_empty(Db, Prefix) ->
     end).
 
 
+append_dir(St, Dir) ->
+    #st{
+        dir_list = DirList
+    } = St,
+    St#st{
+        dir_list = DirList ++ [Dir]
+    }.
+
+
 init_run_loop(Db, Prefix) ->
     {StartKey, EndKey} = erlfdb_tuple:range({Prefix}),
     St = #st{
@@ -274,7 +322,10 @@ init_run_loop(Db, Prefix) ->
         is_snapshot = undefined,
         last_version = 0,
         pids = [],
-        directory_extension = undefined
+
+        dir_list = [erlfdb_directory:root()],
+        dir_index = 0,
+        dir_error_index = 0
     },
     %% lists:foreach(fun({K, V}) ->
     %%     io:format("'~s'~n'~s'~n", [py_repr(K), py_repr(V)])
@@ -307,20 +358,22 @@ run_loop(#st{} = St) ->
 
     IsDb = has_suffix(Op, <<"_DATABASE">>),
     IsSS = has_suffix(Op, <<"_SNAPSHOT">>),
+    IsDir = has_prefix(Op, <<"DIRECTORY_">>),
 
     OpName = if not (IsDb or IsSS) -> Op; true ->
         binary:part(Op, {0, size(Op) - 9}) % strip off _DATABASE/_SNAPSHOT
     end,
 
-    PreSt = St#st{
-        op_tuple = OpTuple,
-        is_db = IsDb,
-        is_snapshot = IsSS
-    },
-
     TxObj = if IsDb -> Db; true ->
         get_transaction(TxName)
     end,
+
+    PreSt = St#st{
+        op_tuple = OpTuple,
+        is_db = IsDb,
+        is_snapshot = IsSS,
+        is_directory_op = IsDir
+    },
 
     PostSt = try
         #st{} = execute(TxObj, PreSt, OpName)
@@ -336,7 +389,8 @@ run_loop(#st{} = St) ->
         index = Index + 1,
         op_tuple = undefined,
         is_db = undefined,
-        is_snapshot = undefined
+        is_snapshot = undefined,
+        is_directory_op = undefined
     }).
 
 
@@ -693,9 +747,268 @@ execute(_TxObj, St, <<"UNIT_TESTS">>) ->
     % TODO
     St;
 
+execute(TxObj, #st{is_directory_op = true} = St, Op) ->
+    #st{
+        dir_list = DirList,
+        dir_index = DirIdx
+    } = St,
+    Dir = lists:nth(DirIdx + 1, DirList),
+    if DirIdx /= 20 -> ok; true ->
+        put(watch_id, erlfdb_directory:get_id(Dir))
+    end,
+    try
+        execute_dir(TxObj, St, Dir, Op)
+    catch error:{erlfdb_directory, _} = _R ->
+        %% io:format("DIRECTORY ERROR:~n  ~p~n", [_R]),
+        %% io:format("STATE: ~s :: ~p~n", [Op, St#st{instructions = null, dir_list = null}]),
+        %% io:format("DIR: ~p~n", [Dir]),
+        %% io:format("~p~n~n~n", [erlang:get_stacktrace()]),
+        NewSt = case lists:member(Op, ?DIRECTORY_CREATE_OPS) of
+            true -> append_dir(St, null);
+            false -> St
+        end,
+        stack_push(St, <<"DIRECTORY_ERROR">>),
+        NewSt
+    end;
+
 execute(_TxObj, _St, UnknownOp) ->
     erlang:error({unknown_op, UnknownOp}).
 
+
+execute_dir(_TxObj, St, _Dir, <<"DIRECTORY_CREATE_SUBSPACE">>) ->
+    Path = stack_pop_tuples(St),
+    RawPrefix = stack_pop(St),
+    Subspace = erlfdb_subspace:create(Path, RawPrefix),
+    append_dir(St, Subspace);
+
+execute_dir(_TxObj, St, _Dir, <<"DIRECTORY_CREATE_LAYER">>) ->
+    #st{
+        dir_list = DirList
+    } = St,
+    [Index1, Index2, AllowManual] = stack_pop(St, 3),
+    NodeSS = lists:nth(Index1 + 1, DirList),
+    ContentSS = lists:nth(Index2 + 1, DirList),
+    case (NodeSS == null orelse ContentSS == null) of
+        true ->
+            append_dir(St, null);
+        false ->
+            Opts = [
+                {node_prefix, erlfdb_subspace:key(NodeSS)},
+                {content_prefix, erlfdb_subspace:key(ContentSS)},
+                {allow_manual_names, AllowManual == 1}
+            ],
+            append_dir(St, erlfdb_directory:root(Opts))
+    end;
+
+execute_dir(_TxObj, St, _Dir, <<"DIRECTORY_CHANGE">>) ->
+    #st{
+        dir_list = DirList,
+        dir_error_index = ErrIdx
+    } = St,
+    DirIdx1 = stack_pop(St),
+    DirIdx2 = case lists:nth(DirIdx1 + 1, DirList) of
+        null -> ErrIdx;
+        _ -> DirIdx1
+    end,
+    St#st{
+        dir_index = DirIdx2
+    };
+
+execute_dir(_TxObj, St, _Dir, <<"DIRECTORY_SET_ERROR_INDEX">>) ->
+    St#st{
+        dir_error_index = stack_pop(St)
+    };
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_CREATE_OR_OPEN">>) ->
+    Path = stack_pop_tuples(St),
+    Layer = stack_pop(St),
+    NewDir = erlfdb_directory:create_or_open(TxObj, Dir, Path, Layer),
+    append_dir(St, NewDir);
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_CREATE">>) ->
+    Path = stack_pop_tuples(St),
+    [Layer, Prefix] = stack_pop(St, 2),
+    Opts = [{layer, Layer}, {node_name, Prefix}],
+    NewDir = erlfdb_directory:create(TxObj, Dir, Path, Opts),
+    append_dir(St, NewDir);
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_OPEN">>) ->
+    Path = stack_pop_tuples(St),
+    Layer = stack_pop(St),
+    Opts = [{layer, Layer}],
+    NewDir = erlfdb_directory:open(TxObj, Dir, Path, Opts),
+    append_dir(St, NewDir);
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_MOVE">>) ->
+    {OldPath, NewPath} = stack_pop_tuples(St, 2),
+    NewDir = erlfdb_directory:move(TxObj, Dir, OldPath, NewPath),
+    append_dir(St, NewDir);
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_MOVE_TO">>) ->
+    NewAbsPath = stack_pop_tuples(St),
+    NewDir = erlfdb_directory:move_to(TxObj, Dir, NewAbsPath),
+    append_dir(St, NewDir);
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_REMOVE">>) ->
+    Count = stack_pop(St),
+    case Count == 0 of
+        true ->
+            erlfdb_directory:remove(TxObj, Dir);
+        false ->
+            Path = stack_pop_tuples(St),
+            erlfdb_directory:remove(TxObj, Dir, Path)
+    end,
+    St;
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_REMOVE_IF_EXISTS">>) ->
+    Count = stack_pop(St),
+    case Count == 0 of
+        true ->
+            erlfdb_directory:remove_if_exists(TxObj, Dir);
+        false ->
+            Path = stack_pop_tuples(St),
+            erlfdb_directory:remove_if_exists(TxObj, Dir, Path)
+    end,
+    St;
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_LIST">>) ->
+    Count = stack_pop(St),
+    Results = case Count == 0 of
+        true ->
+            erlfdb_directory:list(TxObj, Dir);
+        false ->
+            Path = stack_pop_tuples(St),
+            erlfdb_directory:list(TxObj, Dir, Path)
+    end,
+    Names = lists:map(fun({N, _}) -> N end, Results),
+    stack_push(St, erlfdb_tuple:pack(list_to_tuple(Names))),
+    St;
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_EXISTS">>) ->
+    Count = stack_pop(St),
+    Result = case Count == 0 of
+        true ->
+            erlfdb_directory:exists(TxObj, Dir);
+        false ->
+            Path = stack_pop_tuples(St),
+            erlfdb_directory:exists(TxObj, Dir, Path)
+    end,
+    case Result of
+        true -> stack_push(St, 1);
+        false -> stack_push(St, 0)
+    end,
+    St;
+
+execute_dir(_TxObj, St, Dir, <<"DIRECTORY_PACK_KEY">>) ->
+    Tuple = stack_pop_tuples(St),
+    Mod = get_dir_or_ss_mod(Dir),
+    Result = Mod:pack(Dir, Tuple),
+    stack_push(St, Result),
+    St;
+
+execute_dir(_TxObj, St, Dir, <<"DIRECTORY_UNPACK_KEY">>) ->
+    Key = stack_pop(St),
+    Mod = get_dir_or_ss_mod(Dir),
+    Tuple = Mod:unpack(Dir, Key),
+    lists:foreach(fun(Elem) ->
+        stack_push(St, Elem)
+    end, tuple_to_list(Tuple)),
+    St;
+
+execute_dir(_TxObj, St, Dir, <<"DIRECTORY_RANGE">>) ->
+    Tuple = stack_pop_tuples(St),
+    Mod = get_dir_or_ss_mod(Dir),
+    {Start, End} = Mod:range(Dir, Tuple),
+    stack_push(St, Start),
+    stack_push(St, End),
+    St;
+
+execute_dir(_TxObj, St, Dir, <<"DIRECTORY_CONTAINS">>) ->
+    Key = stack_pop(St),
+    Mod = get_dir_or_ss_mod(Dir),
+    Result = Mod:contains(Dir, Key),
+    case Result of
+        true -> stack_push(St, 1);
+        false -> stack_push(St, 0)
+    end,
+    St;
+
+execute_dir(_TxObj, St, Dir, <<"DIRECTORY_OPEN_SUBSPACE">>) ->
+    Path = stack_pop_tuples(St),
+    Mod = get_dir_or_ss_mod(Dir),
+    Subspace = Mod:subspace(Dir, Path),
+    append_dir(St, Subspace);
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_LOG_SUBSPACE">>) ->
+    #st{
+        dir_index = DirIndex
+    } = St,
+    Prefix = stack_pop(St),
+    LogKey = erlfdb_tuple:pack({DirIndex}, Prefix),
+    Mod = get_dir_or_ss_mod(Dir),
+    erlfdb:set(TxObj, LogKey, Mod:key(Dir)),
+    St;
+
+execute_dir(TxObj, St, Dir, <<"DIRECTORY_LOG_DIRECTORY">>) ->
+    #st{
+        dir_index = DirIdx
+    } = St,
+    Prefix = stack_pop(St),
+    LogPrefix = erlfdb_tuple:pack({DirIdx}, Prefix),
+
+    Exists = erlfdb_directory:exists(TxObj, Dir),
+    Children = case Exists of
+        true ->
+            ListResult = erlfdb_directory:list(TxObj, Dir),
+            Names = lists:map(fun({N, _}) -> N end, ListResult),
+            list_to_tuple(Names);
+        false ->
+            {}
+    end,
+
+    PathKey = erlfdb_tuple:pack({{utf8, <<"path">>}}, LogPrefix),
+    Path = erlfdb_tuple:pack(list_to_tuple(erlfdb_directory:get_path(Dir))),
+    erlfdb:set(TxObj, PathKey, Path),
+
+    LayerKey = erlfdb_tuple:pack({{utf8, <<"layer">>}}, LogPrefix),
+    Layer = erlfdb_tuple:pack({erlfdb_directory:get_layer(Dir)}),
+    erlfdb:set(TxObj, LayerKey, Layer),
+
+    ExistsKey = erlfdb_tuple:pack({{utf8, <<"exists">>}}, LogPrefix),
+    ExistsVal = erlfdb_tuple:pack({if Exists -> 1; true -> 0 end}),
+    erlfdb:set(TxObj, ExistsKey, ExistsVal),
+
+    ChildrenKey = erlfdb_tuple:pack({{utf8, <<"children">>}}, LogPrefix),
+    ChildrenVal = erlfdb_tuple:pack(Children),
+    erlfdb:set(TxObj, ChildrenKey, ChildrenVal),
+
+    if DirIdx /= 20 -> ok; true ->
+        io:format(standard_error, "~p~n~p~n~p~n~p~n", [erlfdb_directory:get_path(Dir), Layer, Exists, Children])
+    end,
+
+    St;
+
+execute_dir(_TxObj, St, Dir, <<"DIRECTORY_STRIP_PREFIX">>) ->
+    ToStrip = stack_pop(St),
+    Mod = get_dir_or_ss_mod(Dir),
+    DirKey = Mod:key(Dir),
+    DKLen = size(DirKey),
+    case ToStrip of
+        <<DirKey:DKLen/binary, Rest/binary>> ->
+            stack_push(St, Rest);
+        _ ->
+            erlang:error({invalid_prefix_strip, ToStrip, DirKey})
+    end,
+    St;
+
+execute_dir(_TxObj, _St, _Dir, UnknownOp) ->
+    erlang:error({unknown_directory_op, UnknownOp}).
+
+
+get_dir_or_ss_mod(Subspace) when element(1, Subspace) == erlfdb_subspace ->
+    erlfdb_subspace;
+get_dir_or_ss_mod(#{}) ->
+    erlfdb_directory.
 
 
 main([Prefix, APIVsn]) ->
