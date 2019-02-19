@@ -37,33 +37,13 @@
 }).
 
 
-py_repr(Bin) when is_binary(Bin) ->
-    [$'] ++ lists:map(fun(C) ->
-        case C of
-            %% 7 ->
-            %%     "\\a";
-            %% 8 ->
-            %%     "\\b";
-            9 ->
-                "\\t";
-            10 ->
-                "\\n";
-            %% 11 ->
-            %%     "\\v";
-            %% 12 ->
-            %%     "\\f";
-            13 ->
-                "\\r";
-            39 ->
-                "\\'";
-            92 ->
-                "\\\\";
-            _ when C >= 32, C =< 126 ->
-                C;
-            _ ->
-                io_lib:format("\\x~2.16.0b", [C])
-        end
-    end, binary_to_list(Bin)) ++ [$'].
+init_rand() ->
+    case os:getenv("RANDOM_SEED") of
+        false ->
+            ok;
+        Seed ->
+            rand:seed(exsplus, {list_to_integer(Seed), 0, 0})
+    end.
 
 
 stack_create() ->
@@ -93,6 +73,10 @@ stack_handle({From, log}, St) ->
     end, 1, St),
     From ! {self(), ok},
     St;
+
+stack_handle({From, clear}, _St) ->
+    From ! {self(), ok},
+    [];
 
 stack_handle({From, length}, St) ->
     From ! {self(), length(St)},
@@ -127,6 +111,14 @@ stack_handle({From, pop, Count}, St) ->
 %% stack_log(Pid) ->
 %%     Pid ! {self(), log},
 %%     receive {Pid, ok} -> ok end.
+
+
+stack_clear(#st{stack = Pid}) ->
+    stack_clear(Pid);
+
+stack_clear(Pid) ->
+    Pid ! {self(), clear},
+    receive {Pid, ok} -> ok end.
 
 
 stack_size(#st{stack = Pid}) ->
@@ -249,6 +241,15 @@ new_transaction(Db, TxName) ->
     put({'$erlfdb_tx', TxName}, Tx).
 
 
+switch_transaction(Db, TxName) ->
+    case get_transaction(TxName) of
+        undefined ->
+            new_transaction(Db, TxName);
+        _ ->
+            ok
+    end.
+
+
 has_prefix(Subject, Prefix) ->
     PrefLen = size(Prefix),
     case Subject of
@@ -291,8 +292,8 @@ log_stack(Db, Prefix, Items) ->
 
 
 wait_for_empty(Db, Prefix) ->
-    erlfdb:transactional(Db, fun(Tr) ->
-        Future = erlfdb:get_range_startswith(Tr, Prefix, [{limit, 1}]),
+    erlfdb:transactional(Db, fun(Tx) ->
+        Future = erlfdb:get_range_startswith(Tx, Prefix, [{limit, 1}]),
         case erlfdb:wait(Future) of
             [_|_] -> erlang:error({erlfdb_error, 1020});
             [] -> ok
@@ -301,6 +302,10 @@ wait_for_empty(Db, Prefix) ->
 
 
 append_dir(St, Dir) ->
+    case Dir of
+        not_found -> erlang:error(broken);
+        _ -> ok
+    end,
     #st{
         dir_list = DirList
     } = St,
@@ -310,6 +315,7 @@ append_dir(St, Dir) ->
 
 
 init_run_loop(Db, Prefix) ->
+    init_rand(),
     {StartKey, EndKey} = erlfdb_tuple:range({Prefix}),
     St = #st{
         db = Db,
@@ -328,14 +334,14 @@ init_run_loop(Db, Prefix) ->
         dir_error_index = 0
     },
     %% lists:foreach(fun({K, V}) ->
-    %%     io:format("'~s'~n'~s'~n", [py_repr(K), py_repr(V)])
+    %%     io:format("'~s'~n'~s'~n", [erlfdb_util:repr(K), erlfdb_util:repr(V)])
     %% end, St#st.instructions),
     run_loop(St).
 
 
 run_loop(#st{instructions = []} = St) ->
-    lists:foreach(fun(Pid) ->
-        receive {'DOWN', _, _, Pid, _} -> ok end
+    lists:foreach(fun({Pid, Ref}) ->
+        receive {'DOWN', Ref, _, Pid, _} -> ok end
     end, St#st.pids);
 
 run_loop(#st{} = St) ->
@@ -364,8 +370,13 @@ run_loop(#st{} = St) ->
         binary:part(Op, {0, size(Op) - 9}) % strip off _DATABASE/_SNAPSHOT
     end,
 
-    TxObj = if IsDb -> Db; true ->
-        get_transaction(TxName)
+    TxObj = case {IsDb, IsSS} of
+        {true, false} ->
+            Db;
+        {false, false} ->
+            get_transaction(TxName);
+        {false, true} ->
+            erlfdb:snapshot(get_transaction(TxName))
     end,
 
     PreSt = St#st{
@@ -382,6 +393,11 @@ run_loop(#st{} = St) ->
         ErrBin = erlfdb_tuple:pack({<<"ERROR">>, CodeBin}),
         stack_push(St#st.stack, {Index, ErrBin}),
         PreSt
+    end,
+
+    case lists:member(not_found, PostSt#st.dir_list) of
+        true -> erlang:error(bad);
+        false -> ok
     end,
 
     run_loop(PostSt#st{
@@ -406,8 +422,8 @@ execute(_TxObj, St, <<"DUP">>) ->
     St;
 
 execute(_TxObj, St, <<"EMPTY_STACK">>) ->
-    exit(St#st.stack, kill),
-    St#st{stack = stack_create()};
+    stack_clear(St),
+    St;
 
 execute(_TxObj, St, <<"SWAP">>) ->
     Idx = stack_pop(St),
@@ -448,6 +464,7 @@ execute(_TxObj, St, <<"NEW_TRANSACTION">>) ->
 
 execute(_TxObj, St, <<"USE_TRANSACTION">>) ->
     TxName = stack_pop(St),
+    switch_transaction(St#st.db, TxName),
     St#st{
         tx_name = TxName
     };
@@ -460,11 +477,7 @@ execute(TxObj, St, <<"ON_ERROR">>) ->
 
 execute(TxObj, St, <<"GET">>) ->
     Key = stack_pop(St),
-    FunName = if
-        St#st.is_snapshot -> get_ss;
-        true -> get
-    end,
-    Value = case erlfdb:FunName(TxObj, Key) of
+    Value = case erlfdb:get(TxObj, Key) of
         {erlfdb_future, _, _} = Future ->
             erlfdb:wait(Future);
         Else ->
@@ -480,12 +493,8 @@ execute(TxObj, St, <<"GET">>) ->
 
 execute(TxObj, St, <<"GET_KEY">>) ->
     [Key, OrEqual, Offset, Prefix] = stack_pop(St, 4),
-    FunName = if
-        St#st.is_snapshot -> get_key_ss;
-        true -> get_key
-    end,
     Selector = {Key, OrEqual, Offset},
-    Value = case erlfdb:FunName(TxObj, Selector) of
+    Value = case erlfdb:get_key(TxObj, Selector) of
         {erlfdb_future, _, _} = Future ->
             erlfdb:wait(Future);
         Else ->
@@ -504,20 +513,14 @@ execute(TxObj, St, <<"GET_KEY">>) ->
 
 execute(TxObj, St, <<"GET_RANGE">>) ->
     [Start, End, Limit, Reverse, Mode] = stack_pop(St, 5),
-    BaseOpts = [{limit, Limit}, {reverse, Reverse}, {streaming_mode, Mode}],
-    Options = if not St#st.is_snapshot -> BaseOpts; true ->
-        [{snapshot, true} | BaseOpts]
-    end,
+    Options = [{limit, Limit}, {reverse, Reverse}, {streaming_mode, Mode}],
     Result = erlfdb:get_range(TxObj, Start, End, Options),
     stack_push_range(St, Result),
     St;
 
 execute(TxObj, St, <<"GET_RANGE_STARTS_WITH">>) ->
     [Prefix, Limit, Reverse, Mode] = stack_pop(St, 4),
-    BaseOpts = [{limit, Limit}, {reverse, Reverse}, {streaming_mode, Mode}],
-    Options = if not St#st.is_snapshot -> BaseOpts; true ->
-        [{snapshot, true} | BaseOpts]
-    end,
+    Options = [{limit, Limit}, {reverse, Reverse}, {streaming_mode, Mode}],
     Resp = erlfdb:get_range_startswith(TxObj, Prefix, Options),
     stack_push_range(St, Resp),
     St;
@@ -537,10 +540,7 @@ execute(TxObj, St, <<"GET_RANGE_SELECTOR">>) ->
     ] = stack_pop(St, 10),
     Start = {StartKey, StartOrEqual, StartOffset},
     End = {EndKey, EndOrEqual, EndOffset},
-    BaseOpts = [{limit, Limit}, {reverse, Reverse}, {streaming_mode, Mode}],
-    Options = if not St#st.is_snapshot -> BaseOpts; true ->
-        [{snapshot, true} | BaseOpts]
-    end,
+    Options = [{limit, Limit}, {reverse, Reverse}, {streaming_mode, Mode}],
     Resp = erlfdb:get_range(TxObj, Start, End, Options),
     stack_push_range(St, Resp, Prefix),
     St;
@@ -739,7 +739,7 @@ execute(_TxObj, St, <<"START_THREAD">>) ->
 
 execute(_TxObj, St, <<"WAIT_EMPTY">>) ->
     Prefix = stack_pop(St),
-    wait_for_empty(St, Prefix),
+    wait_for_empty(St#st.db, Prefix),
     stack_push(St, <<"WAITED_FOR_EMPTY">>),
     St;
 
@@ -753,16 +753,19 @@ execute(TxObj, #st{is_directory_op = true} = St, Op) ->
         dir_index = DirIdx
     } = St,
     Dir = lists:nth(DirIdx + 1, DirList),
-    if DirIdx /= 20 -> ok; true ->
-        put(watch_id, erlfdb_directory:get_id(Dir))
-    end,
+    %% io:format(standard_error, "~s~n~p~n~n", [Op, Dir]),
     try
         execute_dir(TxObj, St, Dir, Op)
     catch error:{erlfdb_directory, _} = _R ->
+        %% io:format(standard_error, "~b~n", [St#st.index]),
         %% io:format("DIRECTORY ERROR:~n  ~p~n", [_R]),
         %% io:format("STATE: ~s :: ~p~n", [Op, St#st{instructions = null, dir_list = null}]),
         %% io:format("DIR: ~p~n", [Dir]),
         %% io:format("~p~n~n~n", [erlang:get_stacktrace()]),
+        %% if St#st.index /= 4976 -> ok; true ->
+        %%     erlfdb_directory:debug_nodes(St#st.db, Dir),
+        %%     erlang:error(halt)
+        %% end,
         NewSt = case lists:member(Op, ?DIRECTORY_CREATE_OPS) of
             true -> append_dir(St, null);
             false -> St
@@ -828,7 +831,10 @@ execute_dir(TxObj, St, Dir, <<"DIRECTORY_CREATE_OR_OPEN">>) ->
 execute_dir(TxObj, St, Dir, <<"DIRECTORY_CREATE">>) ->
     Path = stack_pop_tuples(St),
     [Layer, Prefix] = stack_pop(St, 2),
-    Opts = [{layer, Layer}, {node_name, Prefix}],
+    Opts = [{layer, Layer}] ++ case Prefix of
+        null -> [];
+        _ -> [{node_name, Prefix}]
+    end,
     NewDir = erlfdb_directory:create(TxObj, Dir, Path, Opts),
     append_dir(St, NewDir);
 
@@ -982,10 +988,6 @@ execute_dir(TxObj, St, Dir, <<"DIRECTORY_LOG_DIRECTORY">>) ->
     ChildrenVal = erlfdb_tuple:pack(Children),
     erlfdb:set(TxObj, ChildrenKey, ChildrenVal),
 
-    if DirIdx /= 20 -> ok; true ->
-        io:format(standard_error, "~p~n~p~n~p~n~p~n", [erlfdb_directory:get_path(Dir), Layer, Exists, Children])
-    end,
-
     St;
 
 execute_dir(_TxObj, St, Dir, <<"DIRECTORY_STRIP_PREFIX">>) ->
@@ -994,10 +996,12 @@ execute_dir(_TxObj, St, Dir, <<"DIRECTORY_STRIP_PREFIX">>) ->
     DirKey = Mod:key(Dir),
     DKLen = size(DirKey),
     case ToStrip of
+        _ when not is_binary(ToStrip) ->
+            erlang:error({erlfdb_directory, prefix_not_a_binary});
         <<DirKey:DKLen/binary, Rest/binary>> ->
             stack_push(St, Rest);
         _ ->
-            erlang:error({invalid_prefix_strip, ToStrip, DirKey})
+            erlang:error({erlfdb_directory, {invalid_prefix_strip, ToStrip, DirKey}})
     end,
     St;
 
@@ -1015,11 +1019,15 @@ main([Prefix, APIVsn]) ->
     main([Prefix, APIVsn, ""]);
 
 main([Prefix, APIVsn, ClusterFileStr]) ->
-    py_repr(<<"foo">>),
+    init_rand(),
     %% Prompt = io_lib:format("GDB Attach to: ~s~n", [os:getpid()]),
     %% io:get_line(Prompt),
     %% io:format("Running tests: ~s ~s ~s~n", [Prefix, APIVsn, ClusterFileStr]),
 
     application:set_env(erlfdb, api_version, list_to_integer(APIVsn)),
     Db = erlfdb:open(iolist_to_binary(ClusterFileStr)),
+    %% io:format(standard_error, "DB CONTENTS:~n", []),
+    %% erlfdb:fold_range(Db, <<>>, <<254,255>>, fun({K, V}, _) ->
+    %%     io:format(standard_error, "~s~n~s~n~n", [erlfdb_util:repr(K), erlfdb_util:repr(V)])
+    %% end, nil, []),
     init_run_loop(Db, iolist_to_binary(Prefix)).

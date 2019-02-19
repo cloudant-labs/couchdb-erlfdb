@@ -41,6 +41,7 @@
     get_id/1,
     get_name/1,
     get_root/1,
+    get_root_for_path/2,
     get_node_prefix/1,
     get_path/1,
     get_layer/1,
@@ -52,7 +53,9 @@
     range/1,
     range/2,
     contains/2,
-    subspace/2
+    subspace/2,
+
+    debug_nodes/2
 ]).
 
 
@@ -88,40 +91,26 @@ create_or_open(TxObj, Node, Path) ->
     create_or_open(TxObj, Node, Path, <<>>).
 
 
-create_or_open(TxObj, Node, Path, undefined) ->
-    create_or_open(TxObj, Node, Path, <<>>);
-
 create_or_open(TxObj, Node, PathIn, Layer) ->
-    erlfdb:transactional(TxObj, fun(Tx) ->
-        Root = get_root(Node),
-        Path = get_path(Node) ++ path_init(PathIn),
-        {ParentPath, [PathName]} = lists:split(length(Path) - 1, Path),
-
-        Parent = lists:foldl(fun(Name, CurrNode) ->
-            try
-                open_int(Tx, CurrNode, Name, <<>>)
-            catch error:{?MODULE, {open_error, path_missing, _}} ->
-                create_int(Tx, CurrNode, Name, <<>>, undefined)
-            end
-        end, Root, ParentPath),
-
-        try
-            open_int(Tx, Parent, PathName, Layer)
-        catch error:{?MODULE, {open_error, path_missing, _}} ->
-            create_int(Tx, Parent, PathName, Layer, undefined)
-        end
-    end).
-
+    {Root, Path} = adj_path(Node, PathIn),
+    case create_or_open_int(TxObj, Root, Path, Layer) of
+        #{is_absolute_root := true} ->
+            ?ERLFDB_ERROR({open_error, cannot_open_root});
+        Else ->
+            Else
+    end.
 
 create(TxObj, Node, Path) ->
     create(TxObj, Node, Path, []).
 
 
-create(TxObj, Node, Path, Options) ->
+create(TxObj, Node, PathIn, Options) ->
+    {Root, Path} = adj_path(Node, PathIn),
+    check_manual_node_name(Root, Options),
     erlfdb:transactional(TxObj, fun(Tx) ->
         Layer = erlfdb_util:get(Options, layer, <<>>),
         NodeName = erlfdb_util:get(Options, node_name, undefined),
-        create_int(Tx, Node, Path, Layer, NodeName)
+        create_int(Tx, Root, Path, Layer, NodeName)
     end).
 
 
@@ -129,10 +118,16 @@ open(TxObj, Node, Path) ->
     open(TxObj, Node, Path, []).
 
 
-open(TxObj, Node, Path, Options) ->
+open(TxObj, Node, PathIn, Options) ->
+    {Root, Path} = adj_path(Node, PathIn),
     erlfdb:transactional(TxObj, fun(Tx) ->
         Layer = erlfdb_util:get(Options, layer, <<>>),
-        open_int(Tx, Node, Path, Layer)
+        case open_int(Tx, Root, Path, Layer) of
+            #{is_absolute_root := true} ->
+                ?ERLFDB_ERROR({open_error, cannot_open_root});
+            Opened ->
+                Opened
+        end
     end).
 
 
@@ -141,9 +136,10 @@ list(TxObj, Node) ->
 
 
 list(TxObj, Node, PathIn) ->
+    {Root, Path} = adj_path(Node, PathIn),
     erlfdb:transactional(TxObj, fun(Tx) ->
-        Path = path_init(PathIn),
-        case find(Tx, Node, Path) of
+        check_version(Tx, Root, read),
+        case find(Tx, Root, Path) of
             not_found ->
                 ?ERLFDB_ERROR({list_error, missing_path, Path});
             ListNode ->
@@ -152,7 +148,6 @@ list(TxObj, Node, PathIn) ->
                 SDStart = <<Subdirs:SDLen/binary, 16#00>>,
                 SDEnd = <<Subdirs:SDLen/binary, 16#FF>>,
                 SubDirKVs = erlfdb:wait(erlfdb:get_range(Tx, SDStart, SDEnd)),
-                watch_log(Node, "LISTING: ~p :: ~p => ~p~n", [get_id(Node), PathIn, SubDirKVs]),
                 lists:map(fun({Key, NodeName}) ->
                     {DName} = ?ERLFDB_EXTRACT(Subdirs, Key),
                     ChildNode = init_node(Tx, ListNode, NodeName, DName),
@@ -167,9 +162,12 @@ exists(TxObj, Node) ->
 
 
 exists(TxObj, Node, PathIn) ->
+    %Root = get_root(Node),
+    Root = get_root_for_path(Node, PathIn),
+    {Root, Path} = adj_path(Root, Node, PathIn),
     erlfdb:transactional(TxObj, fun(Tx) ->
-        Path = get_path(Node) ++ path_init(PathIn),
-        case find(Tx, get_root(Node), Path) of
+        check_version(Tx, Root, read),
+        case find(Tx, Root, Path) of
             not_found ->
                 false;
             _ChildNode ->
@@ -179,13 +177,14 @@ exists(TxObj, Node, PathIn) ->
 
 
 move(TxObj, Node, OldPathIn, NewPathIn) ->
+    {Root, OldPath} = adj_path(Node, OldPathIn),
+    {Root, NewPath} = adj_path(Node, NewPathIn),
     erlfdb:transactional(TxObj, fun(Tx) ->
-        OldPath = path_init(OldPathIn),
-        NewPath = path_init(NewPathIn),
+        check_version(Tx, Root, write),
         check_not_subpath(OldPath, NewPath),
 
-        OldNode = find(Tx, Node, OldPath),
-        NewNode = find(Tx, Node, NewPath),
+        OldNode = find(Tx, Root, OldPath),
+        NewNode = find(Tx, Root, NewPath),
 
         if OldNode /= not_found -> ok; true ->
             ?ERLFDB_ERROR({move_error, missing_source, OldPath})
@@ -196,12 +195,11 @@ move(TxObj, Node, OldPathIn, NewPathIn) ->
         end,
 
         {NewParentPath, [NewName]} = lists:split(length(NewPath) - 1, NewPath),
-        case find(Tx, Node, NewParentPath) of
+        case find(Tx, Root, NewParentPath) of
             not_found ->
                 ?ERLFDB_ERROR({move_error, missing_parent_node, NewParentPath});
             NewParentNode ->
                 check_same_partition(OldNode, NewParentNode),
-
                 ParentId = get_id(NewParentNode),
                 NodeEntryId = ?ERLFDB_PACK(ParentId, {?SUBDIRS, NewName}),
                 erlfdb:set(Tx, NodeEntryId, get_name(OldNode)),
@@ -214,8 +212,18 @@ move(TxObj, Node, OldPathIn, NewPathIn) ->
 move_to(_TxObj, #{is_absolute_root := true}, _NewPath) ->
     ?ERLFDB_ERROR({move_error, root_cannot_be_moved});
 
-move_to(TxObj, Node, NewPath) ->
-    move(TxObj, get_root(Node), get_path(Node), NewPath).
+move_to(TxObj, Node, NewAbsPathIn) ->
+    Root = get_root_for_path(Node, []),
+    RootPath = get_path(Root),
+    RootPathLen = length(RootPath),
+    NewAbsPath = path_init(NewAbsPathIn),
+    NewAbsPrefix = lists:sublist(NewAbsPath, RootPathLen),
+    if NewAbsPrefix == RootPath -> ok; true ->
+        ?ERLFDB_ERROR({move_error, partition_mismatch, RootPath, NewAbsPrefix})
+    end,
+    NodePath = get_path(Node),
+    SrcPath = lists:nthtail(RootPathLen, NodePath),
+    move(TxObj, Root, SrcPath, NewAbsPath).
 
 
 remove(TxObj, Node) ->
@@ -244,6 +252,10 @@ get_name(Node) ->
 
 get_root(Node) ->
     invoke(Node, get_root, []).
+
+
+get_root_for_path(Node, Path) ->
+    invoke(Node, get_root_for_path, [Path]).
 
 
 get_node_prefix(Node) ->
@@ -283,15 +295,28 @@ range(Node) ->
     invoke(Node, range, [{}]).
 
 
-range(Node, PathIn) ->
-    Path = list_to_tuple(path_init(PathIn)),
-    invoke(Node, range, [Path]).
+range(Node, Tuple) ->
+    invoke(Node, range, [Tuple]).
 
 
-subspace(Node, PathIn) ->
-    Path = list_to_tuple(path_init(PathIn)),
+subspace(Node, Path) ->
     invoke(Node, subspace, [Path]).
 
+
+debug_nodes(TxObj, Node) ->
+    Root = get_abs_root(Node),
+    NodePrefix = get_node_prefix(Root),
+    End = ?ERLFDB_EXTEND(NodePrefix, <<16#FF>>),
+    erlfdb:fold_range(TxObj, NodePrefix, End, fun({K, V}, _Acc) ->
+        io:format(standard_error, "~s => ~s~n", [
+                erlfdb_util:repr(K),
+                erlfdb_util:repr(V)
+            ])
+    end, nil).
+
+
+invoke(not_found, _, _) ->
+    erlang:error(broken);
 
 invoke(Node, FunName, Args) ->
     case Node of
@@ -305,9 +330,10 @@ invoke(Node, FunName, Args) ->
 init_root(Options) ->
     DefNodePref = ?DEFAULT_NODE_PREFIX,
     NodePrefix = erlfdb_util:get(Options, node_prefix, DefNodePref),
+    RootNodeId = ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
     ContentPrefix = erlfdb_util:get(Options, content_prefix, <<>>),
-    AllowManual = erlfdb_util:get(Options, allow_manual_names),
-    Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(NodePrefix, <<"hca">>)),
+    AllowManual = erlfdb_util:get(Options, allow_manual_names, false),
+    Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(RootNodeId, <<"hca">>)),
     #{
         id => ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
         node_prefix => NodePrefix,
@@ -318,6 +344,7 @@ init_root(Options) ->
 
         get_id => fun(Self) -> maps:get(id, Self) end,
         get_root => fun(Self) -> Self end,
+        get_root_for_path => fun(Self, _Path) -> Self end,
         get_node_prefix => fun(Self) -> maps:get(node_prefix, Self) end,
         get_path => fun(_Self) -> [] end,
         get_layer => fun(_Self) -> <<>> end
@@ -325,7 +352,6 @@ init_root(Options) ->
 
 
 init_node(Tx, Node, NodeName, PathName) ->
-    watch_log(Node, "INITING: ~p ~p~n", [NodeName, PathName]),
     NodePrefix = get_node_prefix(Node),
     NodeLayerId = ?ERLFDB_PACK(NodePrefix, {NodeName, <<"layer">>}),
     Layer = case erlfdb:wait(erlfdb:get(Tx, NodeLayerId)) of
@@ -336,8 +362,7 @@ init_node(Tx, Node, NodeName, PathName) ->
     end,
     case Layer of
         <<"partition">> ->
-            NewNode = init_partition(Node, NodeName, PathName),
-            check_version(Tx, NewNode, read);
+            init_partition(Node, NodeName, PathName);
         _ ->
             init_directory(Node, NodeName, PathName, Layer)
     end.
@@ -349,8 +374,7 @@ init_partition(ParentNode, NodeName, PathName) ->
     Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(NodePrefix, <<"hca">>)),
     #{
         id => ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
-        name => NodePrefix,
-        partition_name => NodeName,
+        name => NodeName,
         root => get_root(ParentNode),
         node_prefix => NodePrefix,
         content_prefix => NodeName,
@@ -362,8 +386,16 @@ init_partition(ParentNode, NodeName, PathName) ->
         get_id => fun(Self) -> maps:get(id, Self) end,
         get_name => fun(Self) -> maps:get(name, Self) end,
         get_root => fun(Self) -> Self end,
+        get_root_for_path => fun(Self, PathIn) ->
+            case PathIn of
+                {} -> maps:get(root, Self);
+                [] -> maps:get(root, Self);
+                _ -> Self
+            end
+        end,
         get_node_prefix => fun(Self) -> maps:get(node_prefix, Self) end,
-        get_path => fun(Self) -> maps:get(path, Self) end
+        get_path => fun(Self) -> maps:get(path, Self) end,
+        get_layer => fun(_Self) -> <<"partition">> end
     }.
 
 
@@ -380,6 +412,9 @@ init_directory(ParentNode, NodeName, PathName, Layer) ->
         get_id => fun(Self) -> maps:get(id, Self) end,
         get_name => fun(Self) -> maps:get(name, Self) end,
         get_root => fun(Self) -> maps:get(root, Self) end,
+        get_root_for_path => fun(Self, _Path) ->
+            maps:get(root, Self)
+        end,
         get_node_prefix => fun(Self) ->
             Root = maps:get(root, Self),
             get_node_prefix(Root)
@@ -425,21 +460,61 @@ find(Tx, Node, [PathName | RestPath]) ->
     end.
 
 
+create_or_open_int(TxObj, Node, {}, Layer) ->
+    create_or_open_int(TxObj, Node, [], Layer);
+
+create_or_open_int(_TxObj, Node, [], LayerIn) ->
+    Layer = case LayerIn of
+        <<>> -> <<>>;
+        null -> <<>>;
+        undefined -> <<>>;
+        Else when is_binary(Else) -> Else
+    end,
+    NodeLayer = get_layer(Node),
+    if Layer == <<>> orelse Layer == NodeLayer -> ok; true ->
+        ?ERLFDB_ERROR({open_error, layer_mismatch, Layer, NodeLayer})
+    end,
+    Node;
+
+create_or_open_int(TxObj, Node, PathIn, Layer) ->
+    {Root, Path} = adj_path(Node, PathIn),
+    erlfdb:transactional(TxObj, fun(Tx) ->
+        {ParentPath, [PathName]} = lists:split(length(Path) - 1, Path),
+
+        Parent = lists:foldl(fun(Name, CurrNode) ->
+            try
+                open_int(Tx, CurrNode, Name, <<>>)
+            catch error:{?MODULE, {open_error, path_missing, _}} ->
+                create_int(Tx, CurrNode, Name, <<>>, undefined)
+            end
+        end, Root, ParentPath),
+
+        try
+            open_int(Tx, Parent, PathName, Layer)
+        catch error:{?MODULE, {open_error, path_missing, _}} ->
+            create_int(Tx, Parent, PathName, Layer, undefined)
+        end
+    end).
+
+
 create_int(Tx, Node, PathIn, Layer, NodeNameIn) ->
     Path = path_init(PathIn),
     try
-        open_int(Tx, Node, Path, Layer),
+        open_int(Tx, Node, Path, <<>>),
         ?ERLFDB_ERROR({create_error, path_exists, Path})
     catch error:{?MODULE, {open_error, path_missing, _}} ->
+        NodeName = create_node_name(Tx, Node, NodeNameIn),
         {ParentPath, [PathName]} = lists:split(length(Path) - 1, Path),
-        case find(Tx, Node, ParentPath) of
+        case create_or_open_int(Tx, Node, ParentPath, <<>>) of
             not_found ->
                 ?ERLFDB_ERROR({create_error, missing_parent, ParentPath});
             Parent ->
                 check_version(Tx, Parent, write),
-                NodeName = create_node_name(Tx, Parent, NodeNameIn),
                 create_node(Tx, Parent, PathName, NodeName, Layer),
-                find(Tx, Parent, [PathName])
+                R = find(Tx, Parent, [PathName]),
+                if R /= not_found -> R; true ->
+                    erlang:error(broken)
+                end
         end
     end.
 
@@ -455,6 +530,7 @@ create_node(Tx, Parent, PathName, NodeName, LayerIn) ->
 
 
 open_int(Tx, Node, PathIn, Layer) ->
+    check_version(Tx, Node, read),
     Path = path_init(PathIn),
     case find(Tx, Node, Path) of
         not_found ->
@@ -471,9 +547,11 @@ open_int(Tx, Node, PathIn, Layer) ->
 
 
 remove_int(TxObj, Node, PathIn, IgnoreMissing) ->
+    Root = get_root_for_path(Node, PathIn),
+    {Root, Path} = adj_path(Root, Node, PathIn),
     erlfdb:transactional(TxObj, fun(Tx) ->
-        Path = path_init(PathIn),
-        case find(Tx, Node, Path) of
+        check_version(Tx, Root, write),
+        case find(Tx, Root, Path) of
             not_found when IgnoreMissing ->
                 ok;
             not_found ->
@@ -488,15 +566,14 @@ remove_int(TxObj, Node, PathIn, IgnoreMissing) ->
 
 
 remove_recursive(Tx, Node) ->
-    watch_log(Node, "REMOVE RECURSIVE: ~p~n", [Node]),
     % Remove all subdirectories
     lists:foreach(fun({_DirName, ChildNode}) ->
         remove_recursive(Tx, ChildNode)
     end, list(Tx, Node)),
 
     % Delete all content for the node.
-    ContentSubspace = erlfdb_subspace:create({}, get_name(Node)),
-    {ContentStart, ContentEnd} = erlfdb_subspace:range(ContentSubspace),
+    ContentSS = erlfdb_subspace:create({}, get_name(Node)),
+    {ContentStart, ContentEnd} = erlfdb_subspace:range(ContentSS),
     erlfdb:clear_range(Tx, ContentStart, ContentEnd),
 
     % Delete this node from the tree hierarchy
@@ -506,13 +583,20 @@ remove_recursive(Tx, Node) ->
 
 
 remove_from_parent(Tx, Node) ->
-    Root = get_root(Node),
-    Path = get_path(Node),
+    {Root, Path} = adj_path(get_root_for_path(Node, []), Node, []),
     {ParentPath, [PathName]} = lists:split(length(Path) - 1, Path),
     Parent = find(Tx, Root, ParentPath),
 
     NodeEntryId = ?ERLFDB_PACK(get_id(Parent), {?SUBDIRS, PathName}),
     erlfdb:clear(Tx, NodeEntryId).
+
+
+check_manual_node_name(Root, Options) ->
+    AllowManual = maps:get(allow_manual_names, Root),
+    IsManual = lists:keyfind(node_name, 1, Options) /= false,
+    if not (IsManual and not AllowManual) -> ok; true ->
+        ?ERLFDB_ERROR({create_error, manual_node_names_prohibited})
+    end.
 
 
 create_node_name(Tx, Parent, NameIn) ->
@@ -521,8 +605,13 @@ create_node_name(Tx, Parent, NameIn) ->
         allow_manual_names := AllowManual,
         allocator := Allocator
     } = get_root(Parent),
-    case NameIn of
-        _ when NameIn == undefined orelse NameIn == <<>> ->
+    Name = case NameIn of
+        null -> undefined;
+        undefined -> undefined;
+        _ when is_binary(NameIn) -> NameIn
+    end,
+    case Name of
+        _ when Name == undefined ->
             BaseId = erlfdb_hca:allocate(Allocator, Tx),
             CPLen = size(ContentPrefix),
             NewName = <<ContentPrefix:CPLen/binary, BaseId/binary>>,
@@ -536,7 +625,7 @@ create_node_name(Tx, Parent, NameIn) ->
                     })
             end,
 
-            IsFree = is_prefix_free(Tx, Parent, NewName, true),
+            IsFree = is_prefix_free(erlfdb:snapshot(Tx), Parent, NewName),
             if IsFree -> ok; true ->
                 ?ERLFDB_ERROR({
                         create_error,
@@ -546,8 +635,8 @@ create_node_name(Tx, Parent, NameIn) ->
             end,
 
             NewName;
-        _ when AllowManual andalso is_binary(NameIn) ->
-            case is_prefix_free(Tx, Parent, NameIn, false) of
+        _ when AllowManual andalso is_binary(Name) ->
+            case is_prefix_free(Tx, Parent, NameIn) of
                 true ->
                     ok;
                 false ->
@@ -559,7 +648,7 @@ create_node_name(Tx, Parent, NameIn) ->
     end.
 
 
-is_prefix_free(Tx, Parent, NodeName, Snapshot) ->
+is_prefix_free(Tx, Parent, NodeName) ->
     % We have to make sure that NodeName does not interact with
     % anything that currently exists in the tree. This means that
     % it must not be a prefix of any existing node id and also
@@ -588,30 +677,25 @@ is_prefix_free(Tx, Parent, NodeName, Snapshot) ->
             false -> ok
         end,
 
-        % Check if NodeName is a prefix of any existing key
-        Start1 = ?ERLFDB_EXTEND(NodePrefix, NodeName),
-        End1 = ?ERLFDB_EXTEND(NodePrefix, erlfdb_key:strinc(NodeName)),
-        Opts1 = [{snapshot, Snapshot}, {limit, 1}, {streaming_mode, exact}],
-        case erlfdb:wait(erlfdb:get_range(Tx, Start1, End1, Opts1)) of
-            [_E | _] -> throw(false);
-            [] -> ok
-        end,
-
         % Check if any node id is a prefix of NodeName
-        Start2 = <<NodePrefix:NPLen/binary, 16#00>>,
-        End2 = ?ERLFDB_PACK(NodePrefix, {NodeName, null}),
-        Opts2 = [
-                {snapshot, Snapshot},
-                {reverse, true},
-                {limit, 1},
-                {streaming_mode, exact}
-            ],
-        erlfdb:fold_range(Tx, Start2, End2, fun({Key, _} = _E, _) ->
-            case bin_startswith(End2, Key) of
+        Start1 = <<NodePrefix:NPLen/binary, 16#00>>,
+        End1 = ?ERLFDB_PACK(NodePrefix, {NodeName, null}),
+        Opts1 = [{reverse, true}, {limit, 1}, {streaming_mode, exact}],
+        erlfdb:fold_range(Tx, Start1, End1, fun({Key, _} = _E, _) ->
+            case bin_startswith(End1, Key) of
                 true -> throw(false);
                 false -> ok
             end
-        end, nil, Opts2),
+        end, nil, Opts1),
+
+        % Check if NodeName is a prefix of any existing key
+        Start2 = ?ERLFDB_EXTEND(NodePrefix, NodeName),
+        End2 = ?ERLFDB_EXTEND(NodePrefix, erlfdb_key:strinc(NodeName)),
+        Opts2 = [{limit, 1}, {streaming_mode, exact}],
+        case erlfdb:wait(erlfdb:get_range(Tx, Start2, End2, Opts2)) of
+            [_E | _] -> throw(false);
+            [] -> ok
+        end,
 
         true
     catch throw:false ->
@@ -628,11 +712,14 @@ bin_startswith(Subject, Prefix) ->
 
 
 check_version(Tx, Node, PermLevel) ->
-    VsnKey = ?ERLFDB_EXTEND(get_id(Node), <<"version">>),
+    Root = get_root(Node),
+    VsnKey = ?ERLFDB_EXTEND(get_id(Root), <<"version">>),
     {LV1, LV2, _LV3} = ?LAYER_VERSION,
     {Major, Minor, Patch} = case erlfdb:wait(erlfdb:get(Tx, VsnKey)) of
-        not_found ->
+        not_found when PermLevel == write ->
             initialize_directory(Tx, VsnKey);
+        not_found ->
+            ?LAYER_VERSION;
         VsnBin ->
             <<
                 V1:32/little-unsigned,
@@ -665,11 +752,23 @@ initialize_directory(Tx, VsnKey) ->
 
 
 check_same_partition(OldNode, NewParentNode) ->
-    OldRoot = get_root(OldNode),
+    OldRoot = get_root_for_path(OldNode, []),
     NewRoot = get_root(NewParentNode),
     if NewRoot == OldRoot -> ok; true ->
         ?ERLFDB_ERROR({move_error, partition_mismatch, OldRoot, NewRoot})
     end.
+
+
+adj_path(Node, PathIn) ->
+    adj_path(get_root(Node), Node, PathIn).
+
+
+adj_path(Root, Node, PathIn) ->
+    RootPathLen = length(get_path(Root)),
+    NodePath = get_path(Node),
+    NodeRelPath = lists:nthtail(RootPathLen, NodePath),
+    Path = NodeRelPath ++ path_init(PathIn),
+    {Root, Path}.
 
 
 path_init(<<_/binary>> = Bin) ->
@@ -725,8 +824,14 @@ check_not_subpath(OldPath, NewPath) ->
     end.
 
 
-watch_log(Node, Fmt, Args) ->
-    case get_id(Node) == get(watch_id) of
-        true -> io:format(standard_error, Fmt, Args);
-        false -> ok
-    end.
+get_abs_root(#{is_absolute_root := true} = Root) ->
+    Root;
+get_abs_root(#{root := Root}) ->
+    get_abs_root(Root).
+
+
+%% watch_log(Node, Fmt, Args) ->
+%%     case get_id(Node) == get(watch_id) of
+%%         true -> io:format(standard_error, Fmt, Args);
+%%         false -> ok
+%%     end.

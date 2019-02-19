@@ -469,10 +469,12 @@ init() ->
         end,
         ok = select_api_version(Vsn),
 
-        Opts = case application:get_env(erlfdb, network_options) of
-            {ok, O} when is_list(O) -> O;
-            undefined -> []
-        end,
+        %% Opts = case application:get_env(erlfdb, network_options) of
+        %%     {ok, O} when is_list(O) -> O;
+        %%     undefined -> []
+        %% end,
+
+        Opts = [trace_enable],
 
         lists:foreach(fun(Option) ->
             case Option of

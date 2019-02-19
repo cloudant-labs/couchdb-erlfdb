@@ -126,7 +126,7 @@ search_candidate(HCA, Tx, {Start, WindowSize}) ->
         [{CounterKey, _}] ->
             {LStart} = ?ERLFDB_EXTRACT(Counters, CounterKey),
             if LStart == Start -> ok; true ->
-                throw(hca_restart)
+                throw(hca_retry)
             end;
         _ ->
             ok
@@ -137,7 +137,7 @@ search_candidate(HCA, Tx, {Start, WindowSize}) ->
             erlfdb:add_write_conflict_key(Tx, CandidateValueKey),
             erlfdb_tuple:pack({Candidate});
         _ ->
-            throw(hca_restart)
+            throw(hca_retry)
     end.
 
 
@@ -151,7 +151,7 @@ clear_previous_window(HCA, Tx, Start) ->
     {RRangeStart, RRangeEnd} = ?ERLFDB_RANGE(Recent, Start),
 
     erlfdb:clear_range(Tx, CRangeStart, CRangeEnd),
-    erlfdb:set_option(Tx, next_write_no_conflict_range),
+    erlfdb:set_option(Tx, next_write_no_write_conflict_range),
     erlfdb:clear_range(Tx, RRangeStart, RRangeEnd).
 
 
