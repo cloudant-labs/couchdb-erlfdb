@@ -754,11 +754,13 @@ execute(TxObj, #st{is_directory_op = true} = St, Op) ->
     } = St,
     Dir = lists:nth(DirIdx + 1, DirList),
     %% io:format(standard_error, "~s~n~p~n~n", [Op, Dir]),
+    %% if St#st.index /= 106 -> ok; true ->
+    %%     io:format(standard_error, "~s~n", [Op])
+    %% end,
     try
         execute_dir(TxObj, St, Dir, Op)
     catch error:{erlfdb_directory, _} = _R ->
-        %% io:format(standard_error, "~b~n", [St#st.index]),
-        %% io:format("DIRECTORY ERROR:~n  ~p~n", [_R]),
+        %% io:format("DIRECTORY ERROR: ~p~n  ~p~n", [St#st.index, _R]),
         %% io:format("STATE: ~s :: ~p~n", [Op, St#st{instructions = null, dir_list = null}]),
         %% io:format("DIR: ~p~n", [Dir]),
         %% io:format("~p~n~n~n", [erlang:get_stacktrace()]),

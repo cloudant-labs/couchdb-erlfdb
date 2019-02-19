@@ -93,6 +93,9 @@ create_or_open(TxObj, Node, Path) ->
 
 create_or_open(TxObj, Node, PathIn, Layer) ->
     {Root, Path} = adj_path(Node, PathIn),
+    if Path /= [] -> ok; true ->
+        ?ERLFDB_ERROR({open_error, cannot_open_root})
+    end,
     case create_or_open_int(TxObj, Root, Path, Layer) of
         #{is_absolute_root := true} ->
             ?ERLFDB_ERROR({open_error, cannot_open_root});
@@ -120,14 +123,12 @@ open(TxObj, Node, Path) ->
 
 open(TxObj, Node, PathIn, Options) ->
     {Root, Path} = adj_path(Node, PathIn),
+    if Path /= [] -> ok; true ->
+        ?ERLFDB_ERROR({open_error, cannot_open_root})
+    end,
     erlfdb:transactional(TxObj, fun(Tx) ->
         Layer = erlfdb_util:get(Options, layer, <<>>),
-        case open_int(Tx, Root, Path, Layer) of
-            #{is_absolute_root := true} ->
-                ?ERLFDB_ERROR({open_error, cannot_open_root});
-            Opened ->
-                Opened
-        end
+        open_int(Tx, Root, Path, Layer)
     end).
 
 
