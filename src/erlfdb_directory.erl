@@ -461,6 +461,20 @@ find(Tx, Node, [PathName | RestPath]) ->
     end.
 
 
+find_deepest(_Tx, Node, []) ->
+    Node;
+
+find_deepest(Tx, Node, [PathName | RestPath]) ->
+    NodeEntryId = ?ERLFDB_PACK(get_id(Node), {?SUBDIRS, PathName}),
+    case erlfdb:wait(erlfdb:get(Tx, NodeEntryId)) of
+        not_found ->
+            Node;
+        ChildNodeName ->
+            ChildNode = init_node(Tx, Node, ChildNodeName, PathName),
+            find_deepest(Tx, ChildNode, RestPath)
+    end.
+
+
 create_or_open_int(TxObj, Node, {}, Layer) ->
     create_or_open_int(TxObj, Node, [], Layer);
 
@@ -504,7 +518,8 @@ create_int(Tx, Node, PathIn, Layer, NodeNameIn) ->
         open_int(Tx, Node, Path, <<>>),
         ?ERLFDB_ERROR({create_error, path_exists, Path})
     catch error:{?MODULE, {open_error, path_missing, _}} ->
-        NodeName = create_node_name(Tx, Node, NodeNameIn),
+        Deepest = find_deepest(Tx, Node, Path),
+        NodeName = create_node_name(Tx, Deepest, NodeNameIn),
         {ParentPath, [PathName]} = lists:split(length(Path) - 1, Path),
         case create_or_open_int(Tx, Node, ParentPath, <<>>) of
             not_found ->
@@ -682,8 +697,10 @@ is_prefix_free(Tx, Parent, NodeName) ->
         Start1 = <<NodePrefix:NPLen/binary, 16#00>>,
         End1 = ?ERLFDB_PACK(NodePrefix, {NodeName, null}),
         Opts1 = [{reverse, true}, {limit, 1}, {streaming_mode, exact}],
+        Subspace = erlfdb_subspace:create({}, get_node_prefix(Parent)),
         erlfdb:fold_range(Tx, Start1, End1, fun({Key, _} = _E, _) ->
-            case bin_startswith(End1, Key) of
+            KeyNodeId = element(1, erlfdb_subspace:unpack(Subspace, Key)),
+            case bin_startswith(NodeName, KeyNodeId) of
                 true -> throw(false);
                 false -> ok
             end

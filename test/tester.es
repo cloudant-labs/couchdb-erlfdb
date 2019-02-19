@@ -754,9 +754,6 @@ execute(TxObj, #st{is_directory_op = true} = St, Op) ->
     } = St,
     Dir = lists:nth(DirIdx + 1, DirList),
     %% io:format(standard_error, "~s~n~p~n~n", [Op, Dir]),
-    %% if St#st.index /= 106 -> ok; true ->
-    %%     io:format(standard_error, "~s~n", [Op])
-    %% end,
     try
         execute_dir(TxObj, St, Dir, Op)
     catch error:{erlfdb_directory, _} = _R ->
