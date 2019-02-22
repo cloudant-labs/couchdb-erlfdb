@@ -753,7 +753,11 @@ execute(TxObj, #st{is_directory_op = true} = St, Op) ->
         dir_index = DirIdx
     } = St,
     Dir = lists:nth(DirIdx + 1, DirList),
-    %% io:format(standard_error, "~s~n~p~n~n", [Op, Dir]),
+    %% io:format(standard_error, "~s~n~p~n~n", [Op, St#st.index]),
+    %% if St#st.index /= 6873 -> ok; true ->
+    %%     io:format(standard_error, "~p~n", [Dir]),
+    %%     erlfdb_directory:debug_nodes(St#st.db, Dir)
+    %% end,
     try
         execute_dir(TxObj, St, Dir, Op)
     catch error:{erlfdb_directory, _} = _R ->
@@ -761,7 +765,7 @@ execute(TxObj, #st{is_directory_op = true} = St, Op) ->
         %% io:format("STATE: ~s :: ~p~n", [Op, St#st{instructions = null, dir_list = null}]),
         %% io:format("DIR: ~p~n", [Dir]),
         %% io:format("~p~n~n~n", [erlang:get_stacktrace()]),
-        %% if St#st.index /= 4976 -> ok; true ->
+        %% if St#st.index /= 3755 -> ok; true ->
         %%     erlfdb_directory:debug_nodes(St#st.db, Dir),
         %%     erlang:error(halt)
         %% end,
@@ -946,10 +950,10 @@ execute_dir(_TxObj, St, Dir, <<"DIRECTORY_OPEN_SUBSPACE">>) ->
 
 execute_dir(TxObj, St, Dir, <<"DIRECTORY_LOG_SUBSPACE">>) ->
     #st{
-        dir_index = DirIndex
+        dir_index = DirIdx
     } = St,
     Prefix = stack_pop(St),
-    LogKey = erlfdb_tuple:pack({DirIndex}, Prefix),
+    LogKey = erlfdb_tuple:pack({DirIdx}, Prefix),
     Mod = get_dir_or_ss_mod(Dir),
     erlfdb:set(TxObj, LogKey, Mod:key(Dir)),
     St;

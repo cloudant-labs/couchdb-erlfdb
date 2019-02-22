@@ -205,7 +205,7 @@ move(TxObj, Node, OldPathIn, NewPathIn) ->
                 NodeEntryId = ?ERLFDB_PACK(ParentId, {?SUBDIRS, NewName}),
                 erlfdb:set(Tx, NodeEntryId, get_name(OldNode)),
                 remove_from_parent(Tx, OldNode),
-                OldNode#{path := NewPath}
+                OldNode#{path := get_path(Root) ++ NewPath}
         end
     end).
 
@@ -218,13 +218,14 @@ move_to(TxObj, Node, NewAbsPathIn) ->
     RootPath = get_path(Root),
     RootPathLen = length(RootPath),
     NewAbsPath = path_init(NewAbsPathIn),
-    NewAbsPrefix = lists:sublist(NewAbsPath, RootPathLen),
-    if NewAbsPrefix == RootPath -> ok; true ->
-        ?ERLFDB_ERROR({move_error, partition_mismatch, RootPath, NewAbsPrefix})
+    IsPrefix = lists:prefix(RootPath, NewAbsPath),
+    if IsPrefix -> ok; true ->
+        ?ERLFDB_ERROR({move_error, partition_mismatch, RootPath, NewAbsPath})
     end,
     NodePath = get_path(Node),
     SrcPath = lists:nthtail(RootPathLen, NodePath),
-    move(TxObj, Root, SrcPath, NewAbsPath).
+    TgtPath = lists:nthtail(RootPathLen, NewAbsPath),
+    move(TxObj, Root, SrcPath, TgtPath).
 
 
 remove(TxObj, Node) ->
@@ -259,6 +260,10 @@ get_root_for_path(Node, Path) ->
     invoke(Node, get_root_for_path, [Path]).
 
 
+get_partition(Node) ->
+    invoke(Node, get_partition, []).
+
+
 get_node_prefix(Node) ->
     invoke(Node, get_node_prefix, []).
 
@@ -272,6 +277,14 @@ get_layer(Node) ->
 
 
 key(Node) ->
+    case Node of
+        #{is_absolute_root := true} ->
+            ?ERLFDB_ERROR({key_error, cannot_get_key_of_root});
+        #{is_partition := true} ->
+            ?ERLFDB_ERROR({key_error, cannot_get_key_of_partition_root});
+        _ ->
+            ok
+    end,
     % Compatibility shim for the subspace layer
     get_name(Node).
 
@@ -304,11 +317,8 @@ subspace(Node, Path) ->
     invoke(Node, subspace, [Path]).
 
 
-debug_nodes(TxObj, Node) ->
-    Root = get_abs_root(Node),
-    NodePrefix = get_node_prefix(Root),
-    End = ?ERLFDB_EXTEND(NodePrefix, <<16#FF>>),
-    erlfdb:fold_range(TxObj, NodePrefix, End, fun({K, V}, _Acc) ->
+debug_nodes(TxObj, _Node) ->
+    erlfdb:fold_range(TxObj, <<16#02>>, <<16#FF>>, fun({K, V}, _Acc) ->
         io:format(standard_error, "~s => ~s~n", [
                 erlfdb_util:repr(K),
                 erlfdb_util:repr(V)
@@ -346,6 +356,7 @@ init_root(Options) ->
         get_id => fun(Self) -> maps:get(id, Self) end,
         get_root => fun(Self) -> Self end,
         get_root_for_path => fun(Self, _Path) -> Self end,
+        get_partition => fun(Self) -> Self end,
         get_node_prefix => fun(Self) -> maps:get(node_prefix, Self) end,
         get_path => fun(_Self) -> [] end,
         get_layer => fun(_Self) -> <<>> end
@@ -372,9 +383,10 @@ init_node(Tx, Node, NodeName, PathName) ->
 init_partition(ParentNode, NodeName, PathName) ->
     NodeNameLen = size(NodeName),
     NodePrefix = <<NodeName:NodeNameLen/binary, 16#FE>>,
-    Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(NodePrefix, <<"hca">>)),
+    RootNodeId = ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
+    Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(RootNodeId, <<"hca">>)),
     #{
-        id => ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
+        id => RootNodeId,
         name => NodeName,
         root => get_root(ParentNode),
         node_prefix => NodePrefix,
@@ -394,6 +406,7 @@ init_partition(ParentNode, NodeName, PathName) ->
                 _ -> Self
             end
         end,
+        get_partition => fun(Self) -> maps:get(root, Self) end,
         get_node_prefix => fun(Self) -> maps:get(node_prefix, Self) end,
         get_path => fun(Self) -> maps:get(path, Self) end,
         get_layer => fun(_Self) -> <<"partition">> end
@@ -413,9 +426,11 @@ init_directory(ParentNode, NodeName, PathName, Layer) ->
         get_id => fun(Self) -> maps:get(id, Self) end,
         get_name => fun(Self) -> maps:get(name, Self) end,
         get_root => fun(Self) -> maps:get(root, Self) end,
-        get_root_for_path => fun(Self, _Path) ->
-            maps:get(root, Self)
+        get_root_for_path => fun(Self, Path) ->
+            NewPath = maps:get(path, Self) ++ path_init(Path),
+            get_root_for_path(maps:get(root, Self), NewPath)
         end,
+        get_partition => fun(Self) -> maps:get(root, Self) end,
         get_node_prefix => fun(Self) ->
             Root = maps:get(root, Self),
             get_node_prefix(Root)
@@ -770,7 +785,7 @@ initialize_directory(Tx, VsnKey) ->
 
 
 check_same_partition(OldNode, NewParentNode) ->
-    OldRoot = get_root_for_path(OldNode, []),
+    OldRoot = get_partition(OldNode),
     NewRoot = get_root(NewParentNode),
     if NewRoot == OldRoot -> ok; true ->
         ?ERLFDB_ERROR({move_error, partition_mismatch, OldRoot, NewRoot})
@@ -842,10 +857,10 @@ check_not_subpath(OldPath, NewPath) ->
     end.
 
 
-get_abs_root(#{is_absolute_root := true} = Root) ->
-    Root;
-get_abs_root(#{root := Root}) ->
-    get_abs_root(Root).
+%% get_abs_root(#{is_absolute_root := true} = Root) ->
+%%     Root;
+%% get_abs_root(#{root := Root}) ->
+%%     get_abs_root(Root).
 
 
 %% watch_log(Node, Fmt, Args) ->
