@@ -45,7 +45,9 @@
     get_node_prefix/1,
     get_path/1,
     get_layer/1,
+    get_subspace/1,
 
+    subspace/2,
     key/1,
     pack/2,
     pack_vs/2,
@@ -53,7 +55,6 @@
     range/1,
     range/2,
     contains/2,
-    subspace/2,
 
     debug_nodes/2
 ]).
@@ -276,45 +277,40 @@ get_layer(Node) ->
     invoke(Node, get_layer, []).
 
 
+get_subspace(Node) ->
+    invoke(Node, get_subspace, []).
+
+
+subspace(Node, Tuple) ->
+    erlfdb_subspace:create(get_subspace(Node), Tuple).
+
+
 key(Node) ->
-    case Node of
-        #{is_absolute_root := true} ->
-            ?ERLFDB_ERROR({key_error, cannot_get_key_of_root});
-        #{is_partition := true} ->
-            ?ERLFDB_ERROR({key_error, cannot_get_key_of_partition_root});
-        _ ->
-            ok
-    end,
-    % Compatibility shim for the subspace layer
-    get_name(Node).
+    erlfdb_subspace:key(get_subspace(Node)).
 
 
-pack(Node, KeyTuple) ->
-    invoke(Node, pack, [KeyTuple]).
+pack(Node, Tuple) ->
+    erlfdb_subspace:pack(get_subspace(Node), Tuple).
 
 
-pack_vs(Node, KeyTuple) ->
-    invoke(Node, pack_vs, [KeyTuple]).
+pack_vs(Node, Tuple) ->
+    erlfdb_subspace:pack_vs(get_subspace(Node), Tuple).
 
 
 unpack(Node, Key) ->
-    invoke(Node, unpack, [Key]).
-
-
-contains(Node, Key) ->
-    invoke(Node, contains, [Key]).
+    erlfdb_subspace:unpack(get_subspace(Node), Key).
 
 
 range(Node) ->
-    invoke(Node, range, [{}]).
+    range(Node, {}).
 
 
 range(Node, Tuple) ->
-    invoke(Node, range, [Tuple]).
+    erlfdb_subspace:range(get_subspace(Node), Tuple).
 
 
-subspace(Node, Path) ->
-    invoke(Node, subspace, [Path]).
+contains(Node, Key) ->
+    erlfdb_subspace:contains(get_subspace(Node), Key).
 
 
 debug_nodes(TxObj, _Node) ->
@@ -359,7 +355,10 @@ init_root(Options) ->
         get_partition => fun(Self) -> Self end,
         get_node_prefix => fun(Self) -> maps:get(node_prefix, Self) end,
         get_path => fun(_Self) -> [] end,
-        get_layer => fun(_Self) -> <<>> end
+        get_layer => fun(_Self) -> <<>> end,
+        get_subspace => fun(_Self) ->
+            ?ERLFDB_ERROR({subspace_error, subspace_unsupported_for_root})
+        end
     }.
 
 
@@ -409,7 +408,10 @@ init_partition(ParentNode, NodeName, PathName) ->
         get_partition => fun(Self) -> maps:get(root, Self) end,
         get_node_prefix => fun(Self) -> maps:get(node_prefix, Self) end,
         get_path => fun(Self) -> maps:get(path, Self) end,
-        get_layer => fun(_Self) -> <<"partition">> end
+        get_layer => fun(_Self) -> <<"partition">> end,
+        get_subspace => fun(_Self) ->
+            ?ERLFDB_ERROR({subspace_error, subspace_unsupported_for_partition})
+        end
     }.
 
 
@@ -437,27 +439,8 @@ init_directory(ParentNode, NodeName, PathName, Layer) ->
         end,
         get_path => fun(Self) -> maps:get(path, Self) end,
         get_layer => fun(Self) -> maps:get(layer, Self) end,
-        range => fun(Self, Tuple) ->
-            Subspace = subspace(Self, Tuple),
-            erlfdb_subspace:range(Subspace)
-        end,
-        pack => fun(Self, Tuple) ->
-            erlfdb_tuple:pack(Tuple, maps:get(name, Self))
-        end,
-        pack_vs => fun(Self, Tuple) ->
-            erlfdb_tuple:pack_vs(Tuple, maps:get(name, Self))
-        end,
-        unpack => fun(Self, Key) ->
-            Subspace = subspace(Self, {}),
-            erlfdb_subspace:unpack(Subspace, Key)
-        end,
-        contains => fun(Self, Key) ->
-            Subspace = subspace(Self, {}),
-            erlfdb_subspace:contains(Subspace, Key)
-        end,
-        subspace => fun(Self, Tuple) ->
-            Name = maps:get(name, Self),
-            erlfdb_subspace:create(Tuple, Name)
+        get_subspace => fun(Self) ->
+            erlfdb_subspace:create({}, maps:get(name, Self))
         end
     }.
 
