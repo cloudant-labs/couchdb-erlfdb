@@ -21,8 +21,19 @@
     open/1,
 
     create_transaction/1,
+    create_read_only_transaction/1,
     transactional/2,
     snapshot/1,
+
+    % Iterators
+    create_iter/1,
+    create_iter/2,
+    create_iter/3,
+    destroy_iter/1,
+    checkpoint_iter/1,
+    with_iter/2,
+    with_iter/3,
+    with_iter/4,
 
     % Db/Tx configuration
     set_option/2,
@@ -125,6 +136,7 @@
 -define(IS_FUTURE, {erlfdb_future, _, _}).
 -define(IS_DB, {erlfdb_database, _}).
 -define(IS_TX, {erlfdb_transaction, _}).
+-define(IS_IT, {erlfdb_transaction, {iter, _}}).
 -define(IS_SS, {erlfdb_snapshot, _}).
 -define(GET_TX(SS), element(2, SS)).
 -define(ERLFDB_ERROR, '$erlfdb_error').
@@ -154,6 +166,12 @@ create_transaction(?IS_DB = Db) ->
     erlfdb_nif:database_create_transaction(Db).
 
 
+create_read_only_transaction(?IS_DB = Db) ->
+    Tx = create_transaction(Db),
+    set_option(Tx, disallow_writes),
+    Tx.
+
+
 transactional(?IS_DB = Db, UserFun) when is_function(UserFun, 1) ->
     clear_erlfdb_error(),
     do_transaction(Db, UserFun);
@@ -169,6 +187,43 @@ snapshot(?IS_TX = Tx) ->
     {erlfdb_snapshot, Tx}.
 
 
+create_iter(?IS_DB = Db) ->
+    erlfdb_iter:create(Db, create_read_only_transaction(Db), []).
+
+
+create_iter(?IS_DB = Db, ?IS_TX = Tx) ->
+    erlfdb_iter:create(Db, Tx, []).
+
+
+create_iter(?IS_DB = Db, ?IS_TX = Tx, Opts) ->
+    erlfdb_iter:create(Db, Tx, Opts).
+
+
+destroy_iter(?IS_IT = Iter) ->
+    erlfdb_iter:destroy(Iter).
+
+
+checkpoint_iter(?IS_IT = Iter) ->
+    erlfdb_iter:checkpoint(Iter).
+
+
+with_iter(?IS_DB = Db, Fun) when is_function(Fun, 1) ->
+    with_iter(Db, create_read_only_transaction(Db), [], Fun).
+
+
+with_iter(?IS_DB = Db, ?IS_TX = Tx, Fun) when is_function(Fun, 1) ->
+    with_iter(Db, Tx, [], Fun).
+
+
+with_iter(?IS_DB = Db, ?IS_TX = Tx, Options, Fun) when is_function(Fun, 1) ->
+    Iter = create_iter(Db, Tx, Options),
+    try
+        Fun(Iter)
+    after
+        destroy_iter(Iter)
+    end.
+
+
 set_option(DbOrTx, Option) ->
     set_option(DbOrTx, Option, <<>>).
 
@@ -177,15 +232,15 @@ set_option(?IS_DB = Db, DbOption, Value) ->
     erlfdb_nif:database_set_option(Db, DbOption, Value);
 
 set_option(?IS_TX = Tx, TxOption, Value) ->
-    erlfdb_nif:transaction_set_option(Tx, TxOption, Value).
+    erlfdb_nif:transaction_set_option(get_iter_tx(Tx), TxOption, Value).
 
 
 commit(?IS_TX = Tx) ->
-    erlfdb_nif:transaction_commit(Tx).
+    erlfdb_nif:transaction_commit(get_iter_tx(Tx)).
 
 
 reset(?IS_TX = Tx) ->
-    ok = erlfdb_nif:transaction_reset(Tx).
+    ok = erlfdb_nif:transaction_reset(get_iter_tx(Tx)).
 
 
 cancel(?IS_FUTURE = Future) ->
@@ -298,14 +353,14 @@ get(?IS_DB = Db, Key) ->
     end);
 
 get(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get(Tx, Key, false);
+    erlfdb_nif:transaction_get(get_iter_tx(Tx), Key, false);
 
 get(?IS_SS = SS, Key) ->
     get_ss(?GET_TX(SS), Key).
 
 
 get_ss(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get(Tx, Key, true).
+    erlfdb_nif:transaction_get(get_iter_tx(Tx), Key, true).
 
 
 get_key(?IS_DB = Db, Key) ->
@@ -314,14 +369,14 @@ get_key(?IS_DB = Db, Key) ->
     end);
 
 get_key(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get_key(Tx, Key, false);
+    erlfdb_nif:transaction_get_key(get_iter_tx(Tx), Key, false);
 
 get_key(?IS_SS = SS, Key) ->
     get_key_ss(?GET_TX(SS), Key).
 
 
 get_key_ss(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_get_key(Tx, Key, true).
+    erlfdb_nif:transaction_get_key(get_iter_tx(Tx), Key, true).
 
 
 get_range(DbOrTx, StartKey, EndKey) ->
@@ -360,6 +415,16 @@ fold_range(?IS_DB = Db, StartKey, EndKey, Fun, Acc, Options) ->
     transactional(Db, fun(Tx) ->
         fold_range(Tx, StartKey, EndKey, Fun, Acc, Options)
     end);
+
+fold_range(?IS_IT = Tx, StartKey, EndKey, Fun, Acc, Options) ->
+    fold_range_int(Tx, StartKey, EndKey, fun(Rows, InnerAcc0) ->
+        lists:foldl(fun({K, V}, InnerAcc) ->
+             ok = erlfdb_iter:set_current(Tx, {InnerAcc, K}),
+             NewInnerAcc = Fun({K, V}, InnerAcc),
+             ok = checkpoint_iter(Tx),
+             NewInnerAcc
+        end, InnerAcc0, Rows)
+    end, Acc, Options);
 
 fold_range(?IS_TX = Tx, StartKey, EndKey, Fun, Acc, Options) ->
     fold_range_int(Tx, StartKey, EndKey, fun(Rows, InnerAcc) ->
@@ -493,7 +558,7 @@ watch(?IS_DB = Db, Key) ->
     end);
 
 watch(?IS_TX = Tx, Key) ->
-    erlfdb_nif:transaction_watch(Tx, Key);
+    erlfdb_nif:transaction_watch(get_iter_tx(Tx), Key);
 
 watch(?IS_SS = SS, Key) ->
     watch(?GET_TX(SS), Key).
@@ -663,18 +728,16 @@ fold_range_int(Tx, #fold_st{} = St, Fun, Acc) ->
     RangeFuture = fold_range_future_int(Tx, St),
     fold_range_int(Tx, RangeFuture, Fun, Acc);
 
-fold_range_int(Tx, {fold_info, St, Future}, Fun, Acc) ->
-    #fold_st{
-        start_key = StartKey,
-        end_key = EndKey,
-        limit = Limit,
-        iteration = Iteration,
-        reverse = Reverse
-    } = St,
+fold_range_int(?IS_IT = Tx, {fold_info, St, Future}, Fun, Acc) ->
+    #fold_st{limit = Limit} = St,
 
-    {RawRows, Count, HasMore} = wait(Future),
-
-    Count = length(RawRows),
+    {RawRows, Count, HasMore} = try
+        wait(Future)
+    catch
+        error:{erlfdb_error, 1007} ->
+            erlfdb_iter:new_tx(Tx),
+            wait(fold_range_future_int(Tx, St))
+    end,
 
     % If our limit is within the current set of
     % rows we need to truncate the list
@@ -682,29 +745,79 @@ fold_range_int(Tx, {fold_info, St, Future}, Fun, Acc) ->
         lists:sublist(RawRows, Limit)
     end,
 
-    % Invoke our callback to update the accumulator
-    NewAcc = if Rows == [] -> Acc; true ->
-        Fun(Rows, Acc)
+    if Rows == [] -> Acc; true ->
+        {Keys, _} = lists:unzip(Rows),
+        erlfdb_iter:reset_checkpoint(Tx),
+        {NewAcc, LastKey} = try
+            {Fun(Rows, Acc), lists:last(Keys)}
+        catch
+            error:{erlfdb_error, 1007} ->
+                erlfdb_iter:new_tx(Tx),
+                erlfdb_iter:get_checkpoint(Tx, {Acc, undefined})
+        end,
+        % if not all keys were consumed, reset HasMore to be true since
+        HasMore1 = case LastKey =:= lists:last(Keys) of
+            true -> HasMore;
+            false -> true
+        end,
+        fold_range_recurse(Tx, St, Keys, LastKey, HasMore1, Fun, NewAcc)
+    end;
+
+
+fold_range_int(?IS_TX = Tx, {fold_info, St, Future}, Fun, Acc) ->
+    #fold_st{limit = Limit} = St,
+
+    {RawRows, Count, HasMore} = wait(Future),
+
+    % If our limit is within the current set of
+    % rows we need to truncate the list
+    Rows = if Limit == 0 orelse Limit > Count -> RawRows; true ->
+        lists:sublist(RawRows, Limit)
     end,
 
-    % Determine if we have more rows to iterate
-    Recurse = (Rows /= []) and (Limit == 0 orelse Limit > Count) and HasMore,
+    if Rows == [] -> Acc; true ->
+        NewAcc = Fun(Rows, Acc),
+        {Keys, _} = lists:unzip(Rows),
+        LastKey = lists:last(Keys),
+        fold_range_recurse(Tx, St, Keys, LastKey, HasMore, Fun, NewAcc)
+    end.
 
-    if not Recurse -> NewAcc; true ->
-        LastKey = element(1, lists:last(Rows)),
+
+fold_range_recurse(Tx, #fold_st{} = St, _Keys, undefined, _HasMore, Fun, Acc) ->
+    % Callback threw a 1007 before it got a chance to checkpoint anything
+    % retry from the previous state
+    fold_range_int(Tx, St, Fun, Acc);
+
+fold_range_recurse(_Tx, #fold_st{}, _Keys, _LastKey, false, _Fun, Acc) ->
+    Acc;
+
+fold_range_recurse(Tx, #fold_st{} = St, Keys, LastKey, true, Fun, Acc) ->
+     #fold_st{
+        start_key = StartKey,
+        end_key = EndKey,
+        limit = Limit,
+        iteration = Iteration,
+        reverse = Reverse
+    } = St,
+
+    % Find the number of keys used by the client callback
+    Used = length(lists:takewhile(fun(K) -> K =/= LastKey end, Keys)) + 1,
+
+    % Determine if we have more rows to iterate
+    Recurse = Limit == 0 orelse Limit > Used,
+
+    if not Recurse -> Acc; true ->
         {NewStartKey, NewEndKey} = case Reverse /= 0 of
-            true ->
-                {StartKey, erlfdb_key:first_greater_or_equal(LastKey)};
-            false ->
-                {erlfdb_key:first_greater_than(LastKey), EndKey}
+            true -> {StartKey, erlfdb_key:first_greater_or_equal(LastKey)};
+            false -> {erlfdb_key:first_greater_than(LastKey), EndKey}
         end,
         NewSt = St#fold_st{
             start_key = NewStartKey,
             end_key = NewEndKey,
-            limit = if Limit == 0 -> 0; true -> Limit - Count end,
+            limit = if Limit == 0 -> 0; true -> Limit - Used end,
             iteration = Iteration + 1
         },
-        fold_range_int(Tx, NewSt, Fun, NewAcc)
+        fold_range_int(Tx, NewSt, Fun, Acc)
     end.
 
 
@@ -760,3 +873,7 @@ flush_future_message(?IS_FUTURE = Future) ->
     after
         0 -> ok
     end.
+
+
+get_iter_tx(Iter) ->
+    erlfdb_iter:get_tx(Iter).
