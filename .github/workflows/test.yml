@@ -1,0 +1,29 @@
+name: test
+on: [push, pull-request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Install Erlang
+      run: |
+        wget https://packages.erlang-solutions.com/erlang-solutions_2.0_all.deb
+        sudo dpkg -i erlang-solutions_2.0_all.deb
+        sudo apt-get install esl-erlang
+    
+
+    - name: Install FDB server and client
+      env:
+        FDB_VER: 6.2.15
+      run: |
+        wget https://www.foundationdb.org/downloads/${FDB_VER}/ubuntu/installers/foundationdb-clients_${FDB_VER}-1_amd64.deb
+        wget https://www.foundationdb.org/downloads/${FDB_VER}/ubuntu/installers/foundationdb-server_${FDB_VER}-1_amd64.deb
+        sudo dpkg -i foundationdb-clients_${FDB_VER}-1_amd64.deb foundationdb-server_${FDB_VER}-1_amd64.deb
+
+    - uses: actions/checkout@v2
+
+    - name: Compile
+      run: rebar3 compile
+    - name: Run tests
+      run: rebar3 do eunit, ct
