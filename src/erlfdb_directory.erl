@@ -65,6 +65,7 @@
 
 -define(LAYER_VERSION, {1, 0, 0}).
 -define(DEFAULT_NODE_PREFIX, <<16#FE>>).
+-define(DEFAULT_DB_PREFIX, <<16#FD>>).
 -define(SUBDIRS, 0).
 
 
@@ -326,14 +327,19 @@ init_root(Options) ->
     DefNodePref = ?DEFAULT_NODE_PREFIX,
     NodePrefix = erlfdb_util:get(Options, node_prefix, DefNodePref),
     RootNodeId = ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
+    DefDbPref = ?DEFAULT_DB_PREFIX,
+    DbPrefix = erlfdb_util:get(Options, node_prefix, DefDbPref),
+    DbId = ?ERLFDB_EXTEND(DbPrefix, DbPrefix),
     ContentPrefix = erlfdb_util:get(Options, content_prefix, <<>>),
     AllowManual = erlfdb_util:get(Options, allow_manual_names, false),
-    Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(RootNodeId, <<"hca">>)),
+    NodeIdAllocator = erlfdb_hca:create(?ERLFDB_EXTEND(RootNodeId, <<"hca">>)),
+    DbPrefixAllocator = erlfdb_hca:create(?ERLFDB_EXTEND(DbId, <<"hca">>)),
     #{
         id => ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
         node_prefix => NodePrefix,
         content_prefix => ContentPrefix,
-        allocator => Allocator,
+        node_id_allocator => NodeIdAllocator,
+        db_prefix_allocator => DbPrefixAllocator,
         allow_manual_names => AllowManual,
         is_absolute_root => true,
 
@@ -371,14 +377,18 @@ init_partition(ParentNode, NodeName, PathName) ->
     NodeNameLen = size(NodeName),
     NodePrefix = <<NodeName:NodeNameLen/binary, 16#FE>>,
     RootNodeId = ?ERLFDB_EXTEND(NodePrefix, NodePrefix),
-    Allocator = erlfdb_hca:create(?ERLFDB_EXTEND(RootNodeId, <<"hca">>)),
+    NodeIdAllocator = erlfdb_hca:create(?ERLFDB_EXTEND(RootNodeId, <<"hca">>)),
+    DbPrefix =  <<NodeName:NodeNameLen/binary, 16#FF>>,
+    DbId = ?ERLFDB_EXTEND(DbPrefix, DbPrefix),
+    DbPrefixAllocator = erlfdb_hca:create(?ERLFDB_EXTEND(DbId, <<"hca">>)),
     #{
         id => RootNodeId,
         name => NodeName,
         root => get_root(ParentNode),
         node_prefix => NodePrefix,
         content_prefix => NodeName,
-        allocator => Allocator,
+        node_id_allocator => NodeIdAllocator,
+        db_prefix_allocator => DbPrefixAllocator,
         allow_manual_names => false,
         path => path_append(get_path(ParentNode), PathName),
         is_partition => true,
@@ -605,7 +615,7 @@ create_node_name(Tx, Parent, NameIn) ->
     #{
         content_prefix := ContentPrefix,
         allow_manual_names := AllowManual,
-        allocator := Allocator
+        node_id_allocator := NodeIdAllocator
     } = get_root(Parent),
     Name = case NameIn of
         null -> undefined;
@@ -614,7 +624,7 @@ create_node_name(Tx, Parent, NameIn) ->
     end,
     case Name of
         _ when Name == undefined ->
-            BaseId = erlfdb_hca:allocate(Allocator, Tx),
+            BaseId = erlfdb_hca:allocate(NodeIdAllocator, Tx),
             CPLen = size(ContentPrefix),
             NewName = <<ContentPrefix:CPLen/binary, BaseId/binary>>,
 
