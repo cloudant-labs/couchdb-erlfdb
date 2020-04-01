@@ -1,3 +1,6 @@
+MOVED to https://github.com/apache/couchdb-erlfdb
+=================================================
+
 An Erlang Binding to FoundationDB
 ===
 
